@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+Recordings/
+bot_recordings/
+venv/
+.DS_Store
