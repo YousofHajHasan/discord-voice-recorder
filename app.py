@@ -1,173 +1,225 @@
 import discord
 from discord.ext import commands, voice_recv
-import time
-import subprocess
 import os
-import glob # Helps find files to merge
+import time
+import asyncio
+import subprocess
+import glob
 import datetime
 
-
-# Not needed in docker, but useful for local dev.
+# --- CONFIGURATION ---
+# Try to load .env for local testing, but skip if missing (Docker friendly)
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    print("Loaded environment variables from .env file.")
 except ImportError:
-    print("dotenv not installed. Assuming variables are set in system environment.")
-    
+    pass
 
-CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))
-BASE_DIR = "Recordings" # Where to save everything
 TOKEN = os.getenv('DISCORD_TOKEN')
+CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))  # Default: 5 minutes
+BASE_DIR = os.getenv('BASE_DIR', 'Recordings')
+COOLDOWN_SECONDS = 10
 
-print(f"Bot configured with CHUNK_TIME={CHUNK_TIME} seconds.")
+# Parse Allowed Channels (e.g., "12345,67890") into a list of integers
+raw_allowed = os.getenv('ALLOWED_CHANNELS', '')
+if raw_allowed:
+    ALLOWED_CHANNELS = [int(x.strip()) for x in raw_allowed.split(',') if x.strip().isdigit()]
+else:
+    ALLOWED_CHANNELS = [] # Empty list = Allow All Channels
 
+print(f"✅ Configuration Loaded:")
+print(f"   - Chunk Time: {CHUNK_TIME}s")
+print(f"   - Whitelist: {ALLOWED_CHANNELS if ALLOWED_CHANNELS else 'ALL CHANNELS'}")
+
+# --- SETUP ---
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+intents.voice_states = True  # CRITICAL for tracking users
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Stores state: { user_id: {'start_time': 123, 'chunk_num': 1, 'current_file': 'path/to/file.pcm'} }
+# State Management
 user_sessions = {}
+last_action_time = 0
+processing_lock = False  # Prevents joining while merging files
+
+# --- HELPER FUNCTIONS ---
 
 def ensure_folder(user):
-    """Creates a folder for the user if it doesn't exist."""
+    """Creates a folder for the user: Recordings/Username_ID"""
     safe_name = "".join(x for x in user.name if x.isalnum())
     folder_path = os.path.join(BASE_DIR, f"{safe_name}_{user.id}")
     os.makedirs(folder_path, exist_ok=True)
     return folder_path
 
 def convert_and_delete_pcm(pcm_filename):
-    """
-    1. Converts PCM -> MP3
-    2. Deletes the PCM file immediately after success
-    Running as a shell chain ensures we don't delete before conversion finishes.
-    """
-    if not os.path.exists(pcm_filename):
-        return
-
+    """Background task: Convert PCM -> MP3, then delete PCM"""
+    if not os.path.exists(pcm_filename): return
     mp3_filename = pcm_filename.replace('.pcm', '.mp3')
-    print(f"Bg Task: Converting & Deleting {pcm_filename}...")
     
-    # The command: ffmpeg ... && rm ...
-    # This ensures 'rm' only runs if ffmpeg succeeds.
+    # Command: Convert AND (&&) Delete only if successful
     cmd = (
         f"ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"{pcm_filename}\" \"{mp3_filename}\" "
         f"-loglevel error && rm \"{pcm_filename}\""
     )
-    
-    # Run in background (shell=True is required for && to work)
     subprocess.Popen(cmd, shell=True)
 
-def merge_user_audio(folder_path, output_name="Full_Recording.mp3"):
-    """
-    Finds all mp3 chunks in the user's folder and merges them into one file.
-    """
-    # 1. Find all MP3 chunks (exclude previous full recordings)
+def merge_user_audio(folder_path):
+    """Merges all chunk files into one Full_Recording.mp3"""
     chunks = sorted(glob.glob(os.path.join(folder_path, "*_part*.mp3")))
-    
-    if not chunks:
-        return
+    if not chunks: return
 
-    # 2. Create a text file list for ffmpeg
-    list_file_path = os.path.join(folder_path, "files_to_merge.txt")
-    with open(list_file_path, 'w') as f:
+    list_file = os.path.join(folder_path, "files_to_merge.txt")
+    with open(list_file, 'w') as f:
         for chunk in chunks:
-            # ffmpeg requires format: file '/path/to/file.mp3'
             f.write(f"file '{os.path.abspath(chunk)}'\n")
 
-    # 3. Run the merge command
-    output_path = os.path.join(folder_path, output_name)
-    print(f"Merging {len(chunks)} files into {output_path}...")
+    output_path = os.path.join(folder_path, "Full_Recording.mp3")
+    print(f"Merge: Joining {len(chunks)} files in {folder_path}...")
     
     subprocess.run([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
-        '-i', list_file_path, '-c', 'copy', output_path
-    ])
+        '-i', list_file, '-c', 'copy', output_path
+    ], stderr=subprocess.DEVNULL)
     
-    # 4. Cleanup the list file (optional: delete chunks too if you want ONLY the full file)
-    os.remove(list_file_path)
+    os.remove(list_file)
 
-@bot.command()
-async def join(ctx):
-    if not ctx.author.voice:
-        await ctx.send("You are not in a voice channel!")
-        return
-
-    voice_channel = ctx.author.voice.channel
-    vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
-    vc.listen(voice_recv.BasicSink(callback_function))
-    await ctx.send(f"Joined! Recording to folder: `{BASE_DIR}/`")
+# --- RECORDING CALLBACK ---
 
 def callback_function(user, data: voice_recv.VoiceData):
-    if not data.pcm:
-        return
-
-    current_time = time.time()
-    user_id = user.id
+    """Runs continuously receiving audio packets"""
+    if not data.pcm: return
     
-    # Initialize User Session
+    user_id = user.id
+    current_time = time.time()
+    
+    # 1. Start Session
     if user_id not in user_sessions:
-        folder_path = ensure_folder(user)
-        filename = os.path.join(folder_path, f"{user.name}_part1.pcm")
-        
+        folder = ensure_folder(user)
+        filename = os.path.join(folder, f"{user.name}_part1.pcm")
         user_sessions[user_id] = {
             'start_time': current_time, 
             'chunk_num': 1,
             'current_file': filename,
-            'folder': folder_path,
+            'folder': folder,
             'user_name': user.name
         }
 
     session = user_sessions[user_id]
 
-    # Check Timer
+    # 2. Check Chunk Timer
     if current_time - session['start_time'] > CHUNK_TIME:
         old_file = session['current_file']
         
-        # Switch to new file
+        # Rotate File
         session['chunk_num'] += 1
         session['start_time'] = current_time
         new_filename = os.path.join(session['folder'], f"{session['user_name']}_part{session['chunk_num']}.pcm")
         session['current_file'] = new_filename
         
-        # Convert & Delete OLD file
+        # Convert Old Chunk
         convert_and_delete_pcm(old_file)
 
-    # Write Data
+    # 3. Write Audio
     with open(session['current_file'], 'ab') as f:
         f.write(data.pcm)
+        
 
-@bot.command()
-async def stop(ctx):
-    if ctx.voice_client:
-        ctx.voice_client.stop()
-        await ctx.voice_client.disconnect()
-        await ctx.send("Processing final files... (This might take a second)")
+async def stop_recording_and_cleanup(guild):
+    """Stops recording, waits, converts, merges."""
+    global processing_lock, last_action_time
+    
+    if not guild.voice_client: return
+    
+    print(f"🛑 Stopping recording in {guild.name}...")
+    processing_lock = True 
+    
+    guild.voice_client.stop()
+    await guild.voice_client.disconnect()
 
-        # 1. Finish converting all active chunks
-        pending_conversions = []
-        for user_id, session in user_sessions.items():
-            last_file = session['current_file']
-            # We use Popen, so these happen in parallel
-            convert_and_delete_pcm(last_file)
-            pending_conversions.append(session['folder'])
+    # 1. Convert remaining PCMs
+    folders_to_merge = set()
+    for uid, session in user_sessions.items():
+        convert_and_delete_pcm(session['current_file'])
+        folders_to_merge.add(session['folder'])
+    
+    user_sessions.clear()
 
-        # 2. Clear session memory
-        user_sessions.clear()
+    # 2. Wait for ffmpeg to finish (buffer time)
+    await asyncio.sleep(2) 
 
-        # 3. Wait a moment for ffmpeg to finish the last chunks (simple sleep)
-        # In a complex app, you'd check process PIDs, but this is usually enough.
-        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=2))
+    # 3. Merge files
+    for folder in folders_to_merge:
+        merge_user_audio(folder)
+    
+    print(f"✅ Cleanup done. Cooldown started ({COOLDOWN_SECONDS}s)...")
+    
+    # 4. Release Lock after cooldown
+    await asyncio.sleep(COOLDOWN_SECONDS)
+    last_action_time = time.time()
+    processing_lock = False
+    print("🟢 Bot ready for new channels.")
 
-        # 4. Merge Everything
-        for folder in set(pending_conversions):
-            merge_user_audio(folder)
+# --- SENTRY & WHITELIST LOGIC ---
 
-        await ctx.send("✅ All recordings processed and merged!")
-    else:
-        await ctx.send("Not recording.")
+def is_channel_interesting(channel):
+    """Returns True if channel has active (undeafened) humans and is allowed."""
+    if not channel or not channel.members: return False
+    
+    # 1. Whitelist Check
+    if ALLOWED_CHANNELS and channel.id not in ALLOWED_CHANNELS:
+        return False
 
+    # 2. Activity Check
+    for member in channel.members:
+        if member.bot: continue
+        if not member.voice.self_deaf and not member.voice.deaf:
+            return True # Found a valid target!
+            
+    return False
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Triggered on join/leave/mute/deafen."""
+    if member.bot: return
+    if processing_lock: return 
+
+    guild = member.guild
+    vc = guild.voice_client
+
+    # --- SCENARIO 1: Bot is IDLE (Not in VC) ---
+    if not vc:
+        if after.channel and is_channel_interesting(after.channel):
+            if time.time() - last_action_time < COOLDOWN_SECONDS:
+                return
+
+            print(f"👀 Detected active VC: {after.channel.name}. Joining...")
+            try:
+                vc = await after.channel.connect(cls=voice_recv.VoiceRecvClient)
+                vc.listen(voice_recv.BasicSink(callback_function))
+            except Exception as e:
+                print(f"❌ Failed to join: {e}")
+
+    # --- SCENARIO 2: Bot is ACTIVE (Already in VC) ---
+    elif vc:
+        # Check if current channel became empty/boring
+        if not is_channel_interesting(vc.channel):
+            print(f"zzz Channel {vc.channel.name} is empty/deafened. Leaving...")
+            await stop_recording_and_cleanup(guild)
+            
+            # --- SCENARIO 3: Scan for other active channels ---
+            # After leaving, check if there is ANOTHER allowed channel to join
+            # The next event loop will pick it up if we release the lock
+            pass
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("Sentry Mode Active: Watching for undeafened humans...")
+
+# --- RUN ---
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("ERROR: No DISCORD_TOKEN found in environment variables!")
+    print("Error: DISCORD_TOKEN not found.")
