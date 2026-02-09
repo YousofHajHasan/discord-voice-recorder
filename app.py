@@ -4,10 +4,17 @@ import time
 import subprocess
 import os
 import glob # Helps find files to merge
-from dotenv import load_dotenv
 
-# CONFIGURATION
-load_dotenv()
+
+# Not needed in docker, but useful for local dev.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("Loaded environment variables from .env file.")
+except ImportError:
+    print("dotenv not installed. Assuming variables are set in system environment.")
+    
+
 CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))
 BASE_DIR = "Recordings" # Where to save everything
 TOKEN = os.getenv('DISCORD_TOKEN')
