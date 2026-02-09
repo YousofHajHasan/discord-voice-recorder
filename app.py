@@ -124,10 +124,24 @@ def callback_function(user, data: voice_recv.VoiceData):
     # 3. Write Audio
     with open(session['current_file'], 'ab') as f:
         f.write(data.pcm)
-        
+
+async def scan_and_join_active_channel(guild):
+    """
+    Scans the server for any 'interesting' channels and joins the first one found.
+    Used to catch users who undeafened while the bot was busy cleaning up.
+    """
+    for channel in guild.voice_channels:
+        if is_channel_interesting(channel):
+            print(f"🔄 Rescan found active channel: {channel.name}. Joining...")
+            try:
+                vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
+                vc.listen(voice_recv.BasicSink(callback_function))
+                return # Stop after joining one
+            except Exception as e:
+                print(f"❌ Rescan join failed: {e}")
+
 
 async def stop_recording_and_cleanup(guild):
-    """Stops recording, waits, converts, merges."""
     global processing_lock, last_action_time
     
     if not guild.voice_client: return
@@ -146,7 +160,7 @@ async def stop_recording_and_cleanup(guild):
     
     user_sessions.clear()
 
-    # 2. Wait for ffmpeg to finish (buffer time)
+    # 2. Wait for ffmpeg to finish
     await asyncio.sleep(2) 
 
     # 3. Merge files
@@ -159,10 +173,13 @@ async def stop_recording_and_cleanup(guild):
     await asyncio.sleep(COOLDOWN_SECONDS)
     last_action_time = time.time()
     processing_lock = False
-    print("🟢 Bot ready for new channels.")
+    
+    # --- NEW FIX STARTS HERE ---
+    print("🟢 Bot ready. Scanning for missed events...")
+    # Immediately check if anyone is waiting (e.g., they undeafened during cleanup)
+    await scan_and_join_active_channel(guild)
 
 # --- SENTRY & WHITELIST LOGIC ---
-
 def is_channel_interesting(channel):
     """Returns True if channel has active (undeafened) humans and is allowed."""
     if not channel or not channel.members: return False
