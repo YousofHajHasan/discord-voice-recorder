@@ -4,6 +4,7 @@ import time
 import subprocess
 import os
 import glob # Helps find files to merge
+import datetime
 
 
 # Not needed in docker, but useful for local dev.
@@ -156,7 +157,7 @@ async def stop(ctx):
 
         # 3. Wait a moment for ffmpeg to finish the last chunks (simple sleep)
         # In a complex app, you'd check process PIDs, but this is usually enough.
-        await discord.utils.sleep_until(discord.utils.utcnow() + discord.utils.timedelta(seconds=2))
+        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=2))
 
         # 4. Merge Everything
         for folder in set(pending_conversions):
