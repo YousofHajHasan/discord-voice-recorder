@@ -15,7 +15,7 @@ try:
 except ImportError:
     pass
 
-# Testing Watchtower
+# Testing Watchtower 2
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))  # Default: 5 minutes
