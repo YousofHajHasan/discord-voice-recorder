@@ -79,7 +79,7 @@ def merge_user_audio(folder_path):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(folder_path, f"Full_Recording_{timestamp}.mp3")
     
-    print(f"🔀 Merging {len(chunks)} files into {output_path}...")
+    print(f"Merging {len(chunks)} files into {output_path}...")
     
     subprocess.run([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
@@ -164,7 +164,7 @@ def find_interesting_channel(guild):
 async def join_channel(channel):
     """Joins a voice channel and starts recording"""
     try:
-        print(f"🎤 Joining {channel.name} in {channel.guild.name}")
+        print(f"Joining {channel.name} in {channel.guild.name}")
         vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
         vc.listen(voice_recv.BasicSink(callback_function))
         last_packet_time[channel.guild.id] = time.time()
@@ -179,7 +179,7 @@ async def leave_and_cleanup(guild):
     if not vc:
         return
     
-    print(f"🛑 Leaving {vc.channel.name} in {guild.name}")
+    print(f"Leaving {vc.channel.name} in {guild.name}")
     
     # Stop and disconnect
     vc.stop()
@@ -229,14 +229,14 @@ async def monitor_channels():
         if vc and vc.channel:
             # Check if current channel is still interesting
             if not is_channel_interesting(vc.channel):
-                print(f"💤 {vc.channel.name} became inactive")
+                print(f"Channel {vc.channel.name} became inactive")
                 await leave_and_cleanup(guild)
             
             # Check if recording is working (packet health)
             elif guild_id in last_packet_time:
                 silence_duration = current_time - last_packet_time[guild_id]
                 if silence_duration > 10:
-                    print(f"⚠️ No packets for {silence_duration:.0f}s, restarting listener...")
+                    print(f"No packets for {silence_duration:.0f}s, restarting listener...")
                     try:
                         vc.stop()
                         await asyncio.sleep(0.5)
@@ -251,18 +251,18 @@ async def monitor_channels():
         
         # --- SCENARIO 2: Bot is idle ---
         elif target_channel and not in_cooldown:
-            print(f"🔍 Found active channel: {target_channel.name}")
+            print(f"Found active channel: {target_channel.name}")
             await join_channel(target_channel)
         
         # Clean up expired cooldowns
         if in_cooldown and current_time >= guild_cooldowns[guild_id]:
-            print(f"⏰ Cooldown expired for {guild.name}")
+            print(f"Cooldown expired for {guild.name}")
             del guild_cooldowns[guild_id]
 
 @bot.event
 async def on_ready():
-    print(f"🤖 Logged in as {bot.user}")
-    print(f"📡 Monitoring {len(bot.guilds)} servers every {CHECK_INTERVAL}s")
+    print(f"Logged in as {bot.user}")
+    print(f"Monitoring {len(bot.guilds)} servers every {CHECK_INTERVAL}s")
     monitor_channels.start()
 
 # --- RUN ---

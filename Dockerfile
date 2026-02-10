@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # We use an environment variable for the token, so no hardcoding!
-CMD ["python", "app.py"]
+CMD ["python", "-u", "bot.py"]
