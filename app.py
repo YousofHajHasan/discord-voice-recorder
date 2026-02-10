@@ -39,10 +39,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # State Management
 user_sessions = {}
-last_action_time = 0
+cooldown_end_time = {}  # NEW: Track when cooldown ends per guild
 processing_lock = False
 last_packet_time = {}
-pending_rejoin_check = {}  # NEW: Track if we need to check for rejoins after cooldown
 
 # --- HELPER FUNCTIONS ---
 
@@ -137,12 +136,11 @@ async def check_recording_health():
     
     for guild in bot.guilds:
         vc = guild.voice_client
+        guild_id = guild.id
         
         # --- SCENARIO 1: Bot is IN voice channel ---
         if vc and vc.channel:
             if is_channel_interesting(vc.channel):
-                guild_id = guild.id
-                
                 # If we haven't received packets in 10 seconds, restart
                 if guild_id in last_packet_time:
                     time_since_last_packet = time.time() - last_packet_time[guild_id]
@@ -166,28 +164,24 @@ async def check_recording_health():
         
         # --- SCENARIO 2: Bot is IDLE ---
         else:
-            guild_id = guild.id
-            
-            # Check if cooldown has expired AND we have a pending rejoin check
-            if guild_id in pending_rejoin_check:
-                if time.time() >= pending_rejoin_check[guild_id]:
-                    print(f"⏰ Cooldown expired for {guild.name}. Checking for active channels...")
-                    
-                    # Scan for interesting channels
+            # Check if we're past the cooldown period
+            if guild_id in cooldown_end_time:
+                if time.time() >= cooldown_end_time[guild_id]:
+                    # Cooldown is over, check for active channels
                     for channel in guild.voice_channels:
                         if is_channel_interesting(channel):
-                            print(f"🔍 Found active channel: {channel.name}. Joining NOW...")
+                            print(f"🔍 Health check found active channel: {channel.name}. Joining...")
                             try:
                                 vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
                                 vc.listen(voice_recv.BasicSink(callback_function))
                                 last_packet_time[guild_id] = time.time()
-                                del pending_rejoin_check[guild_id]  # Clear the pending check
+                                del cooldown_end_time[guild_id]  # Clear cooldown
                                 break
                             except Exception as e:
                                 print(f"❌ Join failed: {e}")
                     else:
-                        # No interesting channels found, clear the pending check
-                        del pending_rejoin_check[guild_id]
+                        # No interesting channels found, clear cooldown
+                        del cooldown_end_time[guild_id]
 
 async def restart_voice_connection(guild, channel):
     """Fully disconnect and reconnect to voice channel"""
@@ -206,7 +200,7 @@ async def restart_voice_connection(guild, channel):
         print(f"❌ Reconnect failed: {e}")
 
 async def stop_recording_and_cleanup(guild):
-    global processing_lock, last_action_time
+    global processing_lock
     
     if not guild.voice_client: return
     
@@ -237,15 +231,14 @@ async def stop_recording_and_cleanup(guild):
     
     print(f"✅ Cleanup done. Cooldown started ({COOLDOWN_SECONDS}s)...")
     
-    # 4. Set the rejoin check time (current time + cooldown)
-    pending_rejoin_check[guild.id] = time.time() + COOLDOWN_SECONDS
+    # 4. Set cooldown end time
+    cooldown_end_time[guild.id] = time.time() + COOLDOWN_SECONDS
     
     # 5. Wait for cooldown, then release lock
     await asyncio.sleep(COOLDOWN_SECONDS)
-    last_action_time = time.time()
     processing_lock = False
     
-    print("🟢 Bot ready. Health check will scan for active channels...")
+    print("🟢 Bot ready. Health check will monitor for active channels...")
 
 # --- SENTRY & WHITELIST LOGIC ---
 def is_channel_interesting(channel):
@@ -276,14 +269,21 @@ async def on_voice_state_update(member, before, after):
     # --- SCENARIO 1: Bot is IDLE (Not in VC) ---
     if not vc:
         if after.channel and is_channel_interesting(after.channel):
-            if time.time() - last_action_time < COOLDOWN_SECONDS:
-                return
-
+            # Check if we're still in cooldown
+            if guild.id in cooldown_end_time:
+                if time.time() < cooldown_end_time[guild.id]:
+                    # Still in cooldown, don't join yet
+                    # The health check will handle it when cooldown expires
+                    return
+            
             print(f"👀 Detected active VC: {after.channel.name}. Joining...")
             try:
                 vc = await after.channel.connect(cls=voice_recv.VoiceRecvClient)
                 vc.listen(voice_recv.BasicSink(callback_function))
                 last_packet_time[guild.id] = time.time()
+                # Clear cooldown since we're joining
+                if guild.id in cooldown_end_time:
+                    del cooldown_end_time[guild.id]
             except Exception as e:
                 print(f"❌ Failed to join: {e}")
 
