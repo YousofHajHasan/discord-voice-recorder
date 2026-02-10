@@ -6,6 +6,8 @@ import asyncio
 import subprocess
 import glob
 
+# Testing Auto-Reload
+
 # --- CONFIGURATION ---
 try:
     from dotenv import load_dotenv
@@ -89,7 +91,7 @@ def merge_user_audio(folder_path):
     # Optional: Delete chunk files after merging to save space
     for chunk in chunks:
         os.remove(chunk)
-        
+
 # --- RECORDING CALLBACK ---
 
 def callback_function(user, data: voice_recv.VoiceData):
