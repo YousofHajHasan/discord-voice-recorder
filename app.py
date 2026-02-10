@@ -66,32 +66,44 @@ def convert_and_delete_pcm(pcm_filename):
     subprocess.Popen(cmd, shell=True)
 
 def merge_user_audio(folder_path):
-    """Merges all chunk files into one timestamped Full_Recording.mp3"""
+    """Appends all new chunk files into a single persistent Full_Recording.mp3"""
     chunks = sorted(glob.glob(os.path.join(folder_path, "*_part*.mp3")))
     if not chunks: return
 
+    master_file = os.path.join(folder_path, "Full_Recording.mp3")
     list_file = os.path.join(folder_path, "files_to_merge.txt")
+
+    # If a master file already exists, include it first so we append to it
+    files_to_concat = []
+    if os.path.exists(master_file):
+        # Move master to a temp name so ffmpeg can overwrite the original path
+        temp_master = os.path.join(folder_path, "_temp_master.mp3")
+        os.rename(master_file, temp_master)
+        files_to_concat.append(temp_master)
+    else:
+        temp_master = None
+
+    files_to_concat.extend(chunks)
+
     with open(list_file, 'w') as f:
-        for chunk in chunks:
-            f.write(f"file '{os.path.abspath(chunk)}'\n")
+        for filepath in files_to_concat:
+            f.write(f"file '{os.path.abspath(filepath)}'\n")
 
-    # Create timestamped filename
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(folder_path, f"Full_Recording_{timestamp}.mp3")
-    
-    print(f"Merging {len(chunks)} files into {output_path}...")
-    
+    print(f"Appending {len(chunks)} chunk(s) into {master_file}...")
+
     subprocess.run([
-        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
-        '-i', list_file, '-c', 'copy', output_path
+        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+        '-i', list_file, '-c', 'copy', master_file
     ], stderr=subprocess.DEVNULL)
-    
-    os.remove(list_file)
-    
-    # Optional: Delete chunk files after merging to save space
-    for chunk in chunks:
-        os.remove(chunk)
 
+    os.remove(list_file)
+
+    # Clean up temp master and chunk files
+    if temp_master and os.path.exists(temp_master):
+        os.remove(temp_master)
+    for chunk in chunks:
+        if os.path.exists(chunk):
+            os.remove(chunk)
 # --- RECORDING CALLBACK ---
 
 def callback_function(user, data: voice_recv.VoiceData):
