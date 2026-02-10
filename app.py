@@ -64,7 +64,7 @@ def convert_and_delete_pcm(pcm_filename):
     subprocess.Popen(cmd, shell=True)
 
 def merge_user_audio(folder_path):
-    """Merges all chunk files into one Full_Recording.mp3"""
+    """Merges all chunk files into one timestamped Full_Recording.mp3"""
     chunks = sorted(glob.glob(os.path.join(folder_path, "*_part*.mp3")))
     if not chunks: return
 
@@ -73,8 +73,11 @@ def merge_user_audio(folder_path):
         for chunk in chunks:
             f.write(f"file '{os.path.abspath(chunk)}'\n")
 
-    output_path = os.path.join(folder_path, "Full_Recording.mp3")
-    print(f"🔀 Merging {len(chunks)} files in {folder_path}...")
+    # Create timestamped filename
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(folder_path, f"Full_Recording_{timestamp}.mp3")
+    
+    print(f"🔀 Merging {len(chunks)} files into {output_path}...")
     
     subprocess.run([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
@@ -82,7 +85,11 @@ def merge_user_audio(folder_path):
     ], stderr=subprocess.DEVNULL)
     
     os.remove(list_file)
-
+    
+    # Optional: Delete chunk files after merging to save space
+    for chunk in chunks:
+        os.remove(chunk)
+        
 # --- RECORDING CALLBACK ---
 
 def callback_function(user, data: voice_recv.VoiceData):
