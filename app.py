@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands, voice_recv
+from discord.ext import commands, voice_recv, tasks
 import os
 import time
 import asyncio
@@ -8,26 +8,22 @@ import glob
 import datetime
 
 # --- CONFIGURATION ---
-# Try to load .env for local testing, but skip if missing (Docker friendly)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Testing Watchtower 2
-
 TOKEN = os.getenv('DISCORD_TOKEN')
-CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))  # Default: 5 minutes
+CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))
 BASE_DIR = os.getenv('BASE_DIR', 'Recordings')
 COOLDOWN_SECONDS = 10
 
-# Parse Allowed Channels (e.g., "12345,67890") into a list of integers
 raw_allowed = os.getenv('ALLOWED_CHANNELS', '')
 if raw_allowed:
     ALLOWED_CHANNELS = [int(x.strip()) for x in raw_allowed.split(',') if x.strip().isdigit()]
 else:
-    ALLOWED_CHANNELS = [] # Empty list = Allow All Channels
+    ALLOWED_CHANNELS = []
 
 print(f"✅ Configuration Loaded:")
 print(f"   - Chunk Time: {CHUNK_TIME}s")
@@ -37,14 +33,16 @@ print(f"   - Whitelist: {ALLOWED_CHANNELS if ALLOWED_CHANNELS else 'ALL CHANNELS
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.voice_states = True  # CRITICAL for tracking users
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # State Management
 user_sessions = {}
 last_action_time = 0
-processing_lock = False  # Prevents joining while merging files
+processing_lock = False
+last_packet_time = {}
+pending_rejoin_check = {}  # NEW: Track if we need to check for rejoins after cooldown
 
 # --- HELPER FUNCTIONS ---
 
@@ -60,7 +58,6 @@ def convert_and_delete_pcm(pcm_filename):
     if not os.path.exists(pcm_filename): return
     mp3_filename = pcm_filename.replace('.pcm', '.mp3')
     
-    # Command: Convert AND (&&) Delete only if successful
     cmd = (
         f"ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"{pcm_filename}\" \"{mp3_filename}\" "
         f"-loglevel error && rm \"{pcm_filename}\""
@@ -92,6 +89,10 @@ def merge_user_audio(folder_path):
 def callback_function(user, data: voice_recv.VoiceData):
     """Runs continuously receiving audio packets"""
     if not data.pcm: return
+    
+    # Update last packet timestamp for this guild
+    if hasattr(user, 'guild') and user.guild:
+        last_packet_time[user.guild.id] = time.time()
     
     user_id = user.id
     current_time = time.time()
@@ -127,21 +128,82 @@ def callback_function(user, data: voice_recv.VoiceData):
     with open(session['current_file'], 'ab') as f:
         f.write(data.pcm)
 
-async def scan_and_join_active_channel(guild):
-    """
-    Scans the server for any 'interesting' channels and joins the first one found.
-    Used to catch users who undeafened while the bot was busy cleaning up.
-    """
-    for channel in guild.voice_channels:
-        if is_channel_interesting(channel):
-            print(f"🔄 Rescan found active channel: {channel.name}. Joining...")
-            try:
-                vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
-                vc.listen(voice_recv.BasicSink(callback_function))
-                return # Stop after joining one
-            except Exception as e:
-                print(f"❌ Rescan join failed: {e}")
+# --- HEALTH CHECK TASK ---
+@tasks.loop(seconds=5)
+async def check_recording_health():
+    """Monitors if recording stopped and restarts if needed"""
+    if processing_lock:
+        return
+    
+    for guild in bot.guilds:
+        vc = guild.voice_client
+        
+        # --- SCENARIO 1: Bot is IN voice channel ---
+        if vc and vc.channel:
+            if is_channel_interesting(vc.channel):
+                guild_id = guild.id
+                
+                # If we haven't received packets in 10 seconds, restart
+                if guild_id in last_packet_time:
+                    time_since_last_packet = time.time() - last_packet_time[guild_id]
+                    
+                    if time_since_last_packet > 10:
+                        print(f"⚠️ WARNING: No packets for {time_since_last_packet:.0f}s in {vc.channel.name}")
+                        print(f"🔄 Restarting listener...")
+                        
+                        try:
+                            vc.stop()
+                            await asyncio.sleep(1)
+                            
+                            vc.listen(voice_recv.BasicSink(callback_function))
+                            last_packet_time[guild_id] = time.time()
+                            print(f"✅ Listener restarted successfully")
+                        except Exception as e:
+                            print(f"❌ Failed to restart listener: {e}")
+                            await restart_voice_connection(guild, vc.channel)
+                else:
+                    last_packet_time[guild_id] = time.time()
+        
+        # --- SCENARIO 2: Bot is IDLE ---
+        else:
+            guild_id = guild.id
+            
+            # Check if cooldown has expired AND we have a pending rejoin check
+            if guild_id in pending_rejoin_check:
+                if time.time() >= pending_rejoin_check[guild_id]:
+                    print(f"⏰ Cooldown expired for {guild.name}. Checking for active channels...")
+                    
+                    # Scan for interesting channels
+                    for channel in guild.voice_channels:
+                        if is_channel_interesting(channel):
+                            print(f"🔍 Found active channel: {channel.name}. Joining NOW...")
+                            try:
+                                vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
+                                vc.listen(voice_recv.BasicSink(callback_function))
+                                last_packet_time[guild_id] = time.time()
+                                del pending_rejoin_check[guild_id]  # Clear the pending check
+                                break
+                            except Exception as e:
+                                print(f"❌ Join failed: {e}")
+                    else:
+                        # No interesting channels found, clear the pending check
+                        del pending_rejoin_check[guild_id]
 
+async def restart_voice_connection(guild, channel):
+    """Fully disconnect and reconnect to voice channel"""
+    print(f"🔄 Full reconnect to {channel.name}...")
+    try:
+        if guild.voice_client:
+            await guild.voice_client.disconnect()
+        
+        await asyncio.sleep(2)
+        
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
+        vc.listen(voice_recv.BasicSink(callback_function))
+        last_packet_time[guild.id] = time.time()
+        print(f"✅ Reconnected successfully")
+    except Exception as e:
+        print(f"❌ Reconnect failed: {e}")
 
 async def stop_recording_and_cleanup(guild):
     global processing_lock, last_action_time
@@ -150,6 +212,10 @@ async def stop_recording_and_cleanup(guild):
     
     print(f"🛑 Stopping recording in {guild.name}...")
     processing_lock = True 
+    
+    # Clean up packet timer
+    if guild.id in last_packet_time:
+        del last_packet_time[guild.id]
     
     guild.voice_client.stop()
     await guild.voice_client.disconnect()
@@ -171,15 +237,15 @@ async def stop_recording_and_cleanup(guild):
     
     print(f"✅ Cleanup done. Cooldown started ({COOLDOWN_SECONDS}s)...")
     
-    # 4. Release Lock after cooldown
+    # 4. Set the rejoin check time (current time + cooldown)
+    pending_rejoin_check[guild.id] = time.time() + COOLDOWN_SECONDS
+    
+    # 5. Wait for cooldown, then release lock
     await asyncio.sleep(COOLDOWN_SECONDS)
     last_action_time = time.time()
     processing_lock = False
     
-    # --- NEW FIX STARTS HERE ---
-    print("🟢 Bot ready. Scanning for missed events...")
-    # Immediately check if anyone is waiting (e.g., they undeafened during cleanup)
-    await scan_and_join_active_channel(guild)
+    print("🟢 Bot ready. Health check will scan for active channels...")
 
 # --- SENTRY & WHITELIST LOGIC ---
 def is_channel_interesting(channel):
@@ -194,7 +260,7 @@ def is_channel_interesting(channel):
     for member in channel.members:
         if member.bot: continue
         if not member.voice.self_deaf and not member.voice.deaf:
-            return True # Found a valid target!
+            return True
             
     return False
 
@@ -217,6 +283,7 @@ async def on_voice_state_update(member, before, after):
             try:
                 vc = await after.channel.connect(cls=voice_recv.VoiceRecvClient)
                 vc.listen(voice_recv.BasicSink(callback_function))
+                last_packet_time[guild.id] = time.time()
             except Exception as e:
                 print(f"❌ Failed to join: {e}")
 
@@ -226,16 +293,12 @@ async def on_voice_state_update(member, before, after):
         if not is_channel_interesting(vc.channel):
             print(f"zzz Channel {vc.channel.name} is empty/deafened. Leaving...")
             await stop_recording_and_cleanup(guild)
-            
-            # --- SCENARIO 3: Scan for other active channels ---
-            # After leaving, check if there is ANOTHER allowed channel to join
-            # The next event loop will pick it up if we release the lock
-            pass
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("Sentry Mode Active: Watching for undeafened humans...")
+    check_recording_health.start()
 
 # --- RUN ---
 if TOKEN:
