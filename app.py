@@ -6,7 +6,7 @@ import asyncio
 import subprocess
 import glob
 
-# Testing Auto-Reload
+# Trigger auto build
 
 # --- CONFIGURATION ---
 try:
