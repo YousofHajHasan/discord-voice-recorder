@@ -5,7 +5,6 @@ import time
 import asyncio
 import subprocess
 import glob
-import datetime
 
 # --- CONFIGURATION ---
 try:
@@ -18,6 +17,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))
 BASE_DIR = os.getenv('BASE_DIR', 'Recordings')
 COOLDOWN_SECONDS = 10
+CHECK_INTERVAL = 3  # Check every 3 seconds
 
 raw_allowed = os.getenv('ALLOWED_CHANNELS', '')
 if raw_allowed:
@@ -27,6 +27,7 @@ else:
 
 print(f"✅ Configuration Loaded:")
 print(f"   - Chunk Time: {CHUNK_TIME}s")
+print(f"   - Check Interval: {CHECK_INTERVAL}s")
 print(f"   - Whitelist: {ALLOWED_CHANNELS if ALLOWED_CHANNELS else 'ALL CHANNELS'}")
 
 # --- SETUP ---
@@ -39,8 +40,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # State Management
 user_sessions = {}
-cooldown_end_time = {}  # NEW: Track when cooldown ends per guild
-processing_lock = False
+guild_cooldowns = {}  # When each guild can rejoin
 last_packet_time = {}
 
 # --- HELPER FUNCTIONS ---
@@ -74,7 +74,7 @@ def merge_user_audio(folder_path):
             f.write(f"file '{os.path.abspath(chunk)}'\n")
 
     output_path = os.path.join(folder_path, "Full_Recording.mp3")
-    print(f"Merge: Joining {len(chunks)} files in {folder_path}...")
+    print(f"🔀 Merging {len(chunks)} files in {folder_path}...")
     
     subprocess.run([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
@@ -89,7 +89,7 @@ def callback_function(user, data: voice_recv.VoiceData):
     """Runs continuously receiving audio packets"""
     if not data.pcm: return
     
-    # Update last packet timestamp for this guild
+    # Update last packet timestamp
     if hasattr(user, 'guild') and user.guild:
         last_packet_time[user.guild.id] = time.time()
     
@@ -114,194 +114,150 @@ def callback_function(user, data: voice_recv.VoiceData):
     if current_time - session['start_time'] > CHUNK_TIME:
         old_file = session['current_file']
         
-        # Rotate File
         session['chunk_num'] += 1
         session['start_time'] = current_time
         new_filename = os.path.join(session['folder'], f"{session['user_name']}_part{session['chunk_num']}.pcm")
         session['current_file'] = new_filename
         
-        # Convert Old Chunk
         convert_and_delete_pcm(old_file)
 
     # 3. Write Audio
     with open(session['current_file'], 'ab') as f:
         f.write(data.pcm)
 
-# --- HEALTH CHECK TASK ---
-@tasks.loop(seconds=5)
-async def check_recording_health():
-    """Monitors if recording stopped and restarts if needed"""
-    if processing_lock:
-        return
-    
-    for guild in bot.guilds:
-        vc = guild.voice_client
-        guild_id = guild.id
-        
-        # --- SCENARIO 1: Bot is IN voice channel ---
-        if vc and vc.channel:
-            if is_channel_interesting(vc.channel):
-                # If we haven't received packets in 10 seconds, restart
-                if guild_id in last_packet_time:
-                    time_since_last_packet = time.time() - last_packet_time[guild_id]
-                    
-                    if time_since_last_packet > 10:
-                        print(f"⚠️ WARNING: No packets for {time_since_last_packet:.0f}s in {vc.channel.name}")
-                        print(f"🔄 Restarting listener...")
-                        
-                        try:
-                            vc.stop()
-                            await asyncio.sleep(1)
-                            
-                            vc.listen(voice_recv.BasicSink(callback_function))
-                            last_packet_time[guild_id] = time.time()
-                            print(f"✅ Listener restarted successfully")
-                        except Exception as e:
-                            print(f"❌ Failed to restart listener: {e}")
-                            await restart_voice_connection(guild, vc.channel)
-                else:
-                    last_packet_time[guild_id] = time.time()
-        
-        # --- SCENARIO 2: Bot is IDLE ---
-        else:
-            # Check if we're past the cooldown period
-            if guild_id in cooldown_end_time:
-                if time.time() >= cooldown_end_time[guild_id]:
-                    # Cooldown is over, check for active channels
-                    for channel in guild.voice_channels:
-                        if is_channel_interesting(channel):
-                            print(f"🔍 Health check found active channel: {channel.name}. Joining...")
-                            try:
-                                vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
-                                vc.listen(voice_recv.BasicSink(callback_function))
-                                last_packet_time[guild_id] = time.time()
-                                del cooldown_end_time[guild_id]  # Clear cooldown
-                                break
-                            except Exception as e:
-                                print(f"❌ Join failed: {e}")
-                    else:
-                        # No interesting channels found, clear cooldown
-                        del cooldown_end_time[guild_id]
+# --- CHANNEL LOGIC ---
 
-async def restart_voice_connection(guild, channel):
-    """Fully disconnect and reconnect to voice channel"""
-    print(f"🔄 Full reconnect to {channel.name}...")
+def is_channel_interesting(channel):
+    """Returns True if channel has active (undeafened) humans and is allowed."""
+    if not channel or not channel.members: 
+        return False
+    
+    # Whitelist Check
+    if ALLOWED_CHANNELS and channel.id not in ALLOWED_CHANNELS:
+        return False
+
+    # Activity Check: Any undeafened human?
+    for member in channel.members:
+        if member.bot: 
+            continue
+        if not member.voice.self_deaf and not member.voice.deaf:
+            return True
+            
+    return False
+
+def find_interesting_channel(guild):
+    """Finds first interesting channel in guild, or None"""
+    for channel in guild.voice_channels:
+        if is_channel_interesting(channel):
+            return channel
+    return None
+
+async def join_channel(channel):
+    """Joins a voice channel and starts recording"""
     try:
-        if guild.voice_client:
-            await guild.voice_client.disconnect()
-        
-        await asyncio.sleep(2)
-        
+        print(f"🎤 Joining {channel.name} in {channel.guild.name}")
         vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
         vc.listen(voice_recv.BasicSink(callback_function))
-        last_packet_time[guild.id] = time.time()
-        print(f"✅ Reconnected successfully")
+        last_packet_time[channel.guild.id] = time.time()
+        return True
     except Exception as e:
-        print(f"❌ Reconnect failed: {e}")
+        print(f"❌ Failed to join {channel.name}: {e}")
+        return False
 
-async def stop_recording_and_cleanup(guild):
-    global processing_lock
+async def leave_and_cleanup(guild):
+    """Leaves voice channel and processes recordings"""
+    vc = guild.voice_client
+    if not vc:
+        return
     
-    if not guild.voice_client: return
+    print(f"🛑 Leaving {vc.channel.name} in {guild.name}")
     
-    print(f"🛑 Stopping recording in {guild.name}...")
-    processing_lock = True 
+    # Stop and disconnect
+    vc.stop()
+    await vc.disconnect()
     
-    # Clean up packet timer
+    # Clear packet timer
     if guild.id in last_packet_time:
         del last_packet_time[guild.id]
     
-    guild.voice_client.stop()
-    await guild.voice_client.disconnect()
-
-    # 1. Convert remaining PCMs
+    # Convert remaining PCMs
     folders_to_merge = set()
     for uid, session in user_sessions.items():
         convert_and_delete_pcm(session['current_file'])
         folders_to_merge.add(session['folder'])
     
     user_sessions.clear()
-
-    # 2. Wait for ffmpeg to finish
-    await asyncio.sleep(2) 
-
-    # 3. Merge files
+    
+    # Wait for conversions
+    await asyncio.sleep(2)
+    
+    # Merge files
     for folder in folders_to_merge:
         merge_user_audio(folder)
     
-    print(f"✅ Cleanup done. Cooldown started ({COOLDOWN_SECONDS}s)...")
-    
-    # 4. Set cooldown end time
-    cooldown_end_time[guild.id] = time.time() + COOLDOWN_SECONDS
-    
-    # 5. Wait for cooldown, then release lock
-    await asyncio.sleep(COOLDOWN_SECONDS)
-    processing_lock = False
-    
-    print("🟢 Bot ready. Health check will monitor for active channels...")
+    # Set cooldown
+    guild_cooldowns[guild.id] = time.time() + COOLDOWN_SECONDS
+    print(f"✅ Cleanup done. Cooldown: {COOLDOWN_SECONDS}s")
 
-# --- SENTRY & WHITELIST LOGIC ---
-def is_channel_interesting(channel):
-    """Returns True if channel has active (undeafened) humans and is allowed."""
-    if not channel or not channel.members: return False
-    
-    # 1. Whitelist Check
-    if ALLOWED_CHANNELS and channel.id not in ALLOWED_CHANNELS:
-        return False
+# --- MAIN POLLING LOOP ---
 
-    # 2. Activity Check
-    for member in channel.members:
-        if member.bot: continue
-        if not member.voice.self_deaf and not member.voice.deaf:
-            return True
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def monitor_channels():
+    """Continuously checks all guilds for interesting channels"""
+    
+    for guild in bot.guilds:
+        vc = guild.voice_client
+        guild_id = guild.id
+        current_time = time.time()
+        
+        # Check if in cooldown
+        in_cooldown = guild_id in guild_cooldowns and current_time < guild_cooldowns[guild_id]
+        
+        # Find interesting channel
+        target_channel = find_interesting_channel(guild)
+        
+        # --- SCENARIO 1: Bot is connected ---
+        if vc and vc.channel:
+            # Check if current channel is still interesting
+            if not is_channel_interesting(vc.channel):
+                print(f"💤 {vc.channel.name} became inactive")
+                await leave_and_cleanup(guild)
             
-    return False
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    """Triggered on join/leave/mute/deafen."""
-    if member.bot: return
-    if processing_lock: return 
-
-    guild = member.guild
-    vc = guild.voice_client
-
-    # --- SCENARIO 1: Bot is IDLE (Not in VC) ---
-    if not vc:
-        if after.channel and is_channel_interesting(after.channel):
-            # Check if we're still in cooldown
-            if guild.id in cooldown_end_time:
-                if time.time() < cooldown_end_time[guild.id]:
-                    # Still in cooldown, don't join yet
-                    # The health check will handle it when cooldown expires
-                    return
-            
-            print(f"👀 Detected active VC: {after.channel.name}. Joining...")
-            try:
-                vc = await after.channel.connect(cls=voice_recv.VoiceRecvClient)
-                vc.listen(voice_recv.BasicSink(callback_function))
-                last_packet_time[guild.id] = time.time()
-                # Clear cooldown since we're joining
-                if guild.id in cooldown_end_time:
-                    del cooldown_end_time[guild.id]
-            except Exception as e:
-                print(f"❌ Failed to join: {e}")
-
-    # --- SCENARIO 2: Bot is ACTIVE (Already in VC) ---
-    elif vc:
-        # Check if current channel became empty/boring
-        if not is_channel_interesting(vc.channel):
-            print(f"zzz Channel {vc.channel.name} is empty/deafened. Leaving...")
-            await stop_recording_and_cleanup(guild)
+            # Check if recording is working (packet health)
+            elif guild_id in last_packet_time:
+                silence_duration = current_time - last_packet_time[guild_id]
+                if silence_duration > 10:
+                    print(f"⚠️ No packets for {silence_duration:.0f}s, restarting listener...")
+                    try:
+                        vc.stop()
+                        await asyncio.sleep(0.5)
+                        vc.listen(voice_recv.BasicSink(callback_function))
+                        last_packet_time[guild_id] = current_time
+                        print("✅ Listener restarted")
+                    except Exception as e:
+                        print(f"❌ Restart failed: {e}, reconnecting...")
+                        await leave_and_cleanup(guild)
+                        if not in_cooldown:
+                            await join_channel(target_channel)
+        
+        # --- SCENARIO 2: Bot is idle ---
+        elif target_channel and not in_cooldown:
+            print(f"🔍 Found active channel: {target_channel.name}")
+            await join_channel(target_channel)
+        
+        # Clean up expired cooldowns
+        if in_cooldown and current_time >= guild_cooldowns[guild_id]:
+            print(f"⏰ Cooldown expired for {guild.name}")
+            del guild_cooldowns[guild_id]
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("Sentry Mode Active: Watching for undeafened humans...")
-    check_recording_health.start()
+    print(f"🤖 Logged in as {bot.user}")
+    print(f"📡 Monitoring {len(bot.guilds)} servers every {CHECK_INTERVAL}s")
+    monitor_channels.start()
 
 # --- RUN ---
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN not found.")
+    print("❌ Error: DISCORD_TOKEN not found")
