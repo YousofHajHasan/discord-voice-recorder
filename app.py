@@ -162,21 +162,25 @@ def callback_function(user, data: voice_recv.VoiceData):
 # --- CHANNEL LOGIC ---
 
 def is_channel_interesting(channel):
-    """Returns True if channel has active (undeafened) humans and is allowed."""
-    if not channel or not channel.members: 
+    """Returns True if channel has an undeafened whitelisted user and is allowed."""
+    if not channel or not channel.members:
         return False
-    
-    # Whitelist Check
+
+    # Don't join if whitelist is empty
+    if not ALLOWED_USERS:
+        return False
+
+    # Channel whitelist check
     if ALLOWED_CHANNELS and channel.id not in ALLOWED_CHANNELS:
         return False
 
-    # Activity Check: Any undeafened human?
+    # Only join if at least one whitelisted user is present and undeafened
     for member in channel.members:
-        if member.bot: 
+        if member.bot:
             continue
-        if not member.voice.self_deaf and not member.voice.deaf:
+        if member.id in ALLOWED_USERS and not member.voice.self_deaf and not member.voice.deaf:
             return True
-            
+
     return False
 
 def find_interesting_channel(guild):
