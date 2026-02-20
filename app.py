@@ -27,10 +27,18 @@ if raw_allowed:
 else:
     ALLOWED_CHANNELS = []
 
+# User Whitelist: Only record these user IDs (empty = record everyone)
+raw_allowed_users = os.getenv('ALLOWED_USERS', '')
+if raw_allowed_users:
+    ALLOWED_USERS = set(int(x.strip()) for x in raw_allowed_users.split(',') if x.strip().isdigit())
+else:
+    ALLOWED_USERS = set()
+
 print(f"✅ Configuration Loaded:")
 print(f"   - Chunk Time: {CHUNK_TIME}s")
 print(f"   - Check Interval: {CHECK_INTERVAL}s")
-print(f"   - Whitelist: {ALLOWED_CHANNELS if ALLOWED_CHANNELS else 'ALL CHANNELS'}")
+print(f"   - Channel Whitelist: {ALLOWED_CHANNELS if ALLOWED_CHANNELS else 'ALL CHANNELS'}")
+print(f"   - User Whitelist: {ALLOWED_USERS if ALLOWED_USERS else 'ALL USERS'}")
 
 # --- SETUP ---
 intents = discord.Intents.default()
@@ -104,12 +112,17 @@ def merge_user_audio(folder_path):
     for chunk in chunks:
         if os.path.exists(chunk):
             os.remove(chunk)
+
 # --- RECORDING CALLBACK ---
 
 def callback_function(user, data: voice_recv.VoiceData):
     """Runs continuously receiving audio packets"""
     if not data.pcm: return
-    
+
+    # ✅ User whitelist check — if whitelist is empty, record no one
+    if not ALLOWED_USERS or user.id not in ALLOWED_USERS:
+        return
+
     # Update last packet timestamp
     if hasattr(user, 'guild') and user.guild:
         last_packet_time[user.guild.id] = time.time()
@@ -270,6 +283,62 @@ async def monitor_channels():
         if in_cooldown and current_time >= guild_cooldowns[guild_id]:
             print(f"Cooldown expired for {guild.name}")
             del guild_cooldowns[guild_id]
+
+# --- WHITELIST COMMANDS ---
+
+def save_whitelist_to_env():
+    """Rewrites the ALLOWED_USERS line in the .env file to persist the current whitelist."""
+    env_path = '.env'
+    new_line = f"ALLOWED_USERS={','.join(str(uid) for uid in ALLOWED_USERS)}\n"
+
+    # Read existing .env content
+    if os.path.exists(env_path):
+        with open(env_path, 'r') as f:
+            lines = f.readlines()
+    else:
+        lines = []
+
+    # Replace existing ALLOWED_USERS line, or append if not found
+    found = False
+    for i, line in enumerate(lines):
+        if line.startswith('ALLOWED_USERS='):
+            lines[i] = new_line
+            found = True
+            break
+
+    if not found:
+        lines.append(new_line)
+
+    with open(env_path, 'w') as f:
+        f.writelines(lines)
+
+@bot.command()
+async def allow(ctx, user_id: int):
+    """Add a user ID to the recording whitelist. Usage: !allow 123456789"""
+    ALLOWED_USERS.add(user_id)
+    save_whitelist_to_env()
+    await ctx.send(f"✅ User `{user_id}` added to the recording whitelist and saved to .env. ({len(ALLOWED_USERS)} user(s) tracked)")
+
+@bot.command()
+async def unallow(ctx, user_id: int):
+    """Remove a user ID from the recording whitelist. Usage: !unallow 123456789"""
+    ALLOWED_USERS.discard(user_id)
+    save_whitelist_to_env()
+    if ALLOWED_USERS:
+        await ctx.send(f"🗑️ User `{user_id}` removed and .env updated. ({len(ALLOWED_USERS)} user(s) remaining)")
+    else:
+        await ctx.send(f"🗑️ User `{user_id}` removed and .env updated. Whitelist is now empty — recording **everyone**.")
+
+@bot.command()
+async def whitelist(ctx):
+    """Show the current user recording whitelist. Usage: !whitelist"""
+    if not ALLOWED_USERS:
+        await ctx.send("📋 User whitelist is empty — **no one** is being recorded. Use `!allow <user_id>` to add someone.")
+    else:
+        ids = '\n'.join(f"• `{uid}`" for uid in ALLOWED_USERS)
+        await ctx.send(f"📋 **Currently recording only these users ({len(ALLOWED_USERS)} total):**\n{ids}")
+
+# --- BOT EVENTS ---
 
 @bot.event
 async def on_ready():
