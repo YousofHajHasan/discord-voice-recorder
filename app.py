@@ -168,8 +168,9 @@ class WhitelistMP3Sink(MP3Sink):
 async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk_num_map: dict):
     """
     Called by Pycord when stop_recording() is invoked.
-    Saves each whitelisted user's audio as a chunk MP3 file,
-    then merges all chunks into Full_Recording.mp3.
+    By this point, Pycord's cleanup() has already called format_audio() on all
+    audio data — so the audio in sink.audio_data is already formatted MP3 bytes.
+    We just need to read and save each user's file.
     """
     print(f"📼 Processing recordings for {guild.name}...")
 
@@ -183,12 +184,15 @@ async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk
         chunk_num = chunk_num_map.get(user_id, 1)
         chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}.mp3")
 
-        # Format audio to MP3 using Pycord's built-in ffmpeg pipeline
+        # Audio is already formatted MP3 — just seek and save
         try:
-            sink.format_audio(audio)
             audio.file.seek(0)
+            data = audio.file.read()
+            if not data:
+                print(f"   ⚠️ Empty audio for {user_name}, skipping.")
+                continue
             with open(chunk_file, 'wb') as f:
-                f.write(audio.file.read())
+                f.write(data)
             print(f"   ✅ Saved chunk for {user_name}: {os.path.basename(chunk_file)}")
         except Exception as e:
             print(f"   ❌ Failed to save audio for {user_name}: {e}")
@@ -281,8 +285,8 @@ async def leave_and_cleanup(guild: discord.Guild):
 
 async def rotate_chunk(guild: discord.Guild):
     """
-    Stops current recording, saves the chunk, then immediately starts a new one.
-    This creates the chunked recording effect without disconnecting.
+    Stops current recording, waits for the callback to finish saving the chunk,
+    then starts a fresh recording immediately. Does not disconnect.
     """
     vc = guild.voice_client
     if not vc or not vc.recording:
@@ -292,16 +296,24 @@ async def rotate_chunk(guild: discord.Guild):
 
     old_chunk_num_map = getattr(vc, '_chunk_num_map', {})
 
-    # Increment chunk numbers for all active users
+    # Next chunk numbers = current + 1 for each known user
     new_chunk_num_map = {uid: num + 1 for uid, num in old_chunk_num_map.items()}
-    # For any new user not yet in the map, they'll start at 1 (handled in recording_finished)
+
+    # Use an event to know when the callback is fully done before starting next chunk
+    chunk_done_event = asyncio.Event()
 
     async def on_chunk_done(sink, *args):
         await recording_finished(sink, guild, old_chunk_num_map)
+        chunk_done_event.set()
 
     try:
         vc.stop_recording()
-        await asyncio.sleep(2)  # Wait for chunk to finish saving
+
+        # Wait for callback to fully finish (up to 30s)
+        try:
+            await asyncio.wait_for(chunk_done_event.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            print(f"⚠️ Chunk callback timed out for {guild.name}, continuing anyway...")
 
         # Start fresh recording for next chunk
         vc._chunk_num_map = new_chunk_num_map
