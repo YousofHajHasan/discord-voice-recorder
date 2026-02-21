@@ -67,16 +67,6 @@ def ensure_folder(user):
     os.makedirs(folder_path, exist_ok=True)
     return folder_path
 
-def convert_and_delete_pcm(pcm_filename):
-    """Background task: Convert PCM -> MP3, then delete PCM"""
-    if not os.path.exists(pcm_filename): return
-    mp3_filename = pcm_filename.replace('.pcm', '.mp3')
-    cmd = (
-        f"ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"{pcm_filename}\" \"{mp3_filename}\" "
-        f"-loglevel error && rm \"{pcm_filename}\""
-    )
-    subprocess.Popen(cmd, shell=True)
-
 def startup_cleanup():
     """
     Runs once on bot startup before joining any VC.
@@ -165,52 +155,122 @@ def merge_user_audio(folder_path):
         if os.path.exists(chunk):
             os.remove(chunk)
 
-# --- RECORDING CALLBACK ---
+# --- RECORDING SINK ---
 
-def callback_function(user, data: voice_recv.VoiceData):
-    """Runs continuously receiving audio packets"""
-    if not data.pcm: return
+class RecordingSink(voice_recv.AudioSink):
+    """
+    Custom AudioSink that receives RAW OPUS packets (wants_opus=True),
+    completely bypassing the library's Opus decoder.
+    This eliminates OpusError: corrupted stream crashes entirely.
+    Each user's Opus packets are piped directly into a persistent ffmpeg
+    process which handles decoding + encoding to MP3 itself.
+    """
 
-    # Guard: user may be None if Discord hasn't resolved the member yet
-    if user is None: return
+    def wants_opus(self) -> bool:
+        return True  # Skip the broken library decoder, receive raw Opus
 
-    # User whitelist check — if whitelist is empty or user not in it, skip
-    if not ALLOWED_USERS or user.id not in ALLOWED_USERS:
-        return
+    def write(self, user, data: voice_recv.VoiceData):
+        # Guard: user may be None if Discord hasn't resolved the member yet
+        if user is None: return
 
-    # Update last packet timestamp
-    if hasattr(user, 'guild') and user.guild:
-        last_packet_time[user.guild.id] = time.time()
+        # User whitelist check
+        if not ALLOWED_USERS or user.id not in ALLOWED_USERS:
+            return
 
-    user_id = user.id
-    current_time = time.time()
+        if not data.opus: return
 
-    # 1. Start Session
-    if user_id not in user_sessions:
-        folder = ensure_folder(user)
-        filename = os.path.join(folder, f"{user.name}_part1.pcm")
-        user_sessions[user_id] = {
+        # Update last packet timestamp
+        if hasattr(user, 'guild') and user.guild:
+            last_packet_time[user.guild.id] = time.time()
+
+        user_id = user.id
+        current_time = time.time()
+
+        # Start session + ffmpeg process if not already running
+        if user_id not in user_sessions:
+            folder = ensure_folder(user)
+            session = self._start_session(user, folder, current_time)
+            user_sessions[user_id] = session
+
+        session = user_sessions[user_id]
+
+        # Chunk timer: close current ffmpeg process, start a new one
+        if current_time - session['start_time'] > CHUNK_TIME:
+            self._rotate_chunk(user, session, current_time)
+
+        # Write raw Opus packet directly into ffmpeg's stdin
+        try:
+            if session['process'] and session['process'].stdin:
+                session['process'].stdin.write(data.opus)
+                session['process'].stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass  # ffmpeg process died, will be restarted on next packet
+
+    def _start_session(self, user, folder, current_time):
+        """Starts a new ffmpeg process for a user, writing directly to MP3."""
+        chunk_num = 1
+        mp3_filename = os.path.join(folder, f"{user.name}_part{chunk_num}.mp3")
+        process = self._spawn_ffmpeg(mp3_filename)
+        return {
             'start_time': current_time,
-            'chunk_num': 1,
-            'current_file': filename,
+            'chunk_num': chunk_num,
+            'current_file': mp3_filename,
             'folder': folder,
-            'user_name': user.name
+            'user_name': user.name,
+            'process': process,
         }
 
-    session = user_sessions[user_id]
-
-    # 2. Check Chunk Timer
-    if current_time - session['start_time'] > CHUNK_TIME:
-        old_file = session['current_file']
+    def _rotate_chunk(self, user, session, current_time):
+        """Closes current ffmpeg process and starts a fresh one for next chunk."""
+        self._close_process(session['process'])
         session['chunk_num'] += 1
         session['start_time'] = current_time
-        new_filename = os.path.join(session['folder'], f"{session['user_name']}_part{session['chunk_num']}.pcm")
-        session['current_file'] = new_filename
-        convert_and_delete_pcm(old_file)
+        mp3_filename = os.path.join(session['folder'], f"{session['user_name']}_part{session['chunk_num']}.mp3")
+        session['current_file'] = mp3_filename
+        session['process'] = self._spawn_ffmpeg(mp3_filename)
 
-    # 3. Write Audio
-    with open(session['current_file'], 'ab') as f:
-        f.write(data.pcm)
+    def _spawn_ffmpeg(self, output_file):
+        """
+        Spawns an ffmpeg process that:
+        - Reads raw Opus packets from stdin
+        - Decodes them (ogg container wraps Opus for ffmpeg to understand)
+        - Encodes to MP3 and writes to output_file
+        """
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'ogg',        # ogg container (wraps raw opus packets)
+            '-i', 'pipe:0',     # read from stdin
+            '-c:a', 'libmp3lame',
+            '-ar', '48000',
+            '-ac', '2',
+            '-b:a', '128k',
+            '-loglevel', 'error',
+            output_file
+        ]
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"❌ Failed to spawn ffmpeg for {output_file}: {e}")
+            return None
+
+    def _close_process(self, process):
+        """Gracefully closes an ffmpeg stdin so it finishes writing the file."""
+        if process and process.stdin:
+            try:
+                process.stdin.close()
+                process.wait(timeout=5)
+            except Exception:
+                process.kill()
+
+    def cleanup(self):
+        """Called when the sink is stopped — close all open ffmpeg processes."""
+        for uid, session in user_sessions.items():
+            self._close_process(session.get('process'))
 
 # --- CHANNEL LOGIC ---
 
@@ -248,7 +308,7 @@ async def join_channel(channel):
     try:
         print(f"Joining {channel.name} in {channel.guild.name}")
         vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
-        vc.listen(voice_recv.BasicSink(callback_function))
+        vc.listen(RecordingSink())  # Raw Opus sink — no decoder, no OpusError
         last_packet_time[channel.guild.id] = time.time()
         return True
     except Exception as e:
@@ -270,18 +330,24 @@ async def leave_and_cleanup(guild):
     last_packet_time.pop(guild.id, None)
     last_restart_time.pop(guild.id, None)
 
-    # Convert remaining PCMs
+    # Close all open ffmpeg processes (they write directly to MP3, no PCM conversion needed)
     folders_to_merge = set()
     for uid, session in user_sessions.items():
-        convert_and_delete_pcm(session['current_file'])
+        process = session.get('process')
+        if process and process.stdin:
+            try:
+                process.stdin.close()
+                process.wait(timeout=5)
+            except Exception:
+                process.kill()
         folders_to_merge.add(session['folder'])
 
     user_sessions.clear()
 
-    # Wait for conversions
+    # Wait a moment to ensure ffmpeg finishes writing
     await asyncio.sleep(2)
 
-    # Merge files
+    # Merge MP3 chunks into Full_Recording.mp3
     for folder in folders_to_merge:
         merge_user_audio(folder)
 
@@ -339,7 +405,7 @@ async def monitor_channels():
                             try:
                                 vc.stop()
                                 await asyncio.sleep(0.5)
-                                vc.listen(voice_recv.BasicSink(callback_function))
+                                vc.listen(RecordingSink())  # Raw Opus sink — no decoder, no OpusError
                                 last_packet_time[guild_id] = current_time
                                 print("✅ Listener restarted")
                             except Exception as e:
