@@ -19,7 +19,9 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))
 BASE_DIR = os.getenv('BASE_DIR', 'Recordings')
 COOLDOWN_SECONDS = 10
-CHECK_INTERVAL = 3  # Check every 3 seconds
+CHECK_INTERVAL = 3      # Check every 3 seconds
+SILENCE_THRESHOLD = 30  # Seconds of no packets before attempting a listener restart
+RESTART_COOLDOWN = 20   # Seconds to wait between listener restarts (prevents in/out loop)
 
 raw_allowed = os.getenv('ALLOWED_CHANNELS', '')
 if raw_allowed:
@@ -27,7 +29,7 @@ if raw_allowed:
 else:
     ALLOWED_CHANNELS = []
 
-# User Whitelist: Only record these user IDs (empty = record everyone)
+# User Whitelist: Only record these user IDs (empty = record no one)
 raw_allowed_users = os.getenv('ALLOWED_USERS', '')
 if raw_allowed_users:
     ALLOWED_USERS = set(int(x.strip()) for x in raw_allowed_users.split(',') if x.strip().isdigit())
@@ -37,8 +39,10 @@ else:
 print(f"✅ Configuration Loaded:")
 print(f"   - Chunk Time: {CHUNK_TIME}s")
 print(f"   - Check Interval: {CHECK_INTERVAL}s")
+print(f"   - Silence Threshold: {SILENCE_THRESHOLD}s")
+print(f"   - Restart Cooldown: {RESTART_COOLDOWN}s")
 print(f"   - Channel Whitelist: {ALLOWED_CHANNELS if ALLOWED_CHANNELS else 'ALL CHANNELS'}")
-print(f"   - User Whitelist: {ALLOWED_USERS if ALLOWED_USERS else 'ALL USERS'}")
+print(f"   - User Whitelist: {ALLOWED_USERS if ALLOWED_USERS else 'EMPTY (no one will be recorded)'}")
 
 # --- SETUP ---
 intents = discord.Intents.default()
@@ -50,8 +54,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # State Management
 user_sessions = {}
-guild_cooldowns = {}  # When each guild can rejoin
-last_packet_time = {}
+guild_cooldowns = {}    # When each guild can rejoin after leaving
+last_packet_time = {}   # Last audio packet received per guild
+last_restart_time = {}  # Last listener restart per guild (enforces RESTART_COOLDOWN)
 
 # --- HELPER FUNCTIONS ---
 
@@ -66,7 +71,6 @@ def convert_and_delete_pcm(pcm_filename):
     """Background task: Convert PCM -> MP3, then delete PCM"""
     if not os.path.exists(pcm_filename): return
     mp3_filename = pcm_filename.replace('.pcm', '.mp3')
-    
     cmd = (
         f"ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"{pcm_filename}\" \"{mp3_filename}\" "
         f"-loglevel error && rm \"{pcm_filename}\""
@@ -84,7 +88,6 @@ def startup_cleanup():
     """
     print(f"🔍 Running startup cleanup on '{BASE_DIR}'...")
 
-    # Ensure base recordings folder exists
     os.makedirs(BASE_DIR, exist_ok=True)
 
     user_folders = [
@@ -133,10 +136,8 @@ def merge_user_audio(folder_path):
     master_file = os.path.join(folder_path, "Full_Recording.mp3")
     list_file = os.path.join(folder_path, "files_to_merge.txt")
 
-    # If a master file already exists, include it first so we append to it
     files_to_concat = []
     if os.path.exists(master_file):
-        # Move master to a temp name so ffmpeg can overwrite the original path
         temp_master = os.path.join(folder_path, "_temp_master.mp3")
         os.rename(master_file, temp_master)
         files_to_concat.append(temp_master)
@@ -158,7 +159,6 @@ def merge_user_audio(folder_path):
 
     os.remove(list_file)
 
-    # Clean up temp master and chunk files
     if temp_master and os.path.exists(temp_master):
         os.remove(temp_master)
     for chunk in chunks:
@@ -174,23 +174,23 @@ def callback_function(user, data: voice_recv.VoiceData):
     # Guard: user may be None if Discord hasn't resolved the member yet
     if user is None: return
 
-    # ✅ User whitelist check — if whitelist is empty, record no one
+    # User whitelist check — if whitelist is empty or user not in it, skip
     if not ALLOWED_USERS or user.id not in ALLOWED_USERS:
         return
 
     # Update last packet timestamp
     if hasattr(user, 'guild') and user.guild:
         last_packet_time[user.guild.id] = time.time()
-    
+
     user_id = user.id
     current_time = time.time()
-    
+
     # 1. Start Session
     if user_id not in user_sessions:
         folder = ensure_folder(user)
         filename = os.path.join(folder, f"{user.name}_part1.pcm")
         user_sessions[user_id] = {
-            'start_time': current_time, 
+            'start_time': current_time,
             'chunk_num': 1,
             'current_file': filename,
             'folder': folder,
@@ -202,12 +202,10 @@ def callback_function(user, data: voice_recv.VoiceData):
     # 2. Check Chunk Timer
     if current_time - session['start_time'] > CHUNK_TIME:
         old_file = session['current_file']
-        
         session['chunk_num'] += 1
         session['start_time'] = current_time
         new_filename = os.path.join(session['folder'], f"{session['user_name']}_part{session['chunk_num']}.pcm")
         session['current_file'] = new_filename
-        
         convert_and_delete_pcm(old_file)
 
     # 3. Write Audio
@@ -262,32 +260,31 @@ async def leave_and_cleanup(guild):
     vc = guild.voice_client
     if not vc:
         return
-    
+
     print(f"Leaving {vc.channel.name} in {guild.name}")
-    
-    # Stop and disconnect
+
     vc.stop()
     await vc.disconnect()
-    
-    # Clear packet timer
-    if guild.id in last_packet_time:
-        del last_packet_time[guild.id]
-    
+
+    # Clear timers
+    last_packet_time.pop(guild.id, None)
+    last_restart_time.pop(guild.id, None)
+
     # Convert remaining PCMs
     folders_to_merge = set()
     for uid, session in user_sessions.items():
         convert_and_delete_pcm(session['current_file'])
         folders_to_merge.add(session['folder'])
-    
+
     user_sessions.clear()
-    
+
     # Wait for conversions
     await asyncio.sleep(2)
-    
+
     # Merge files
     for folder in folders_to_merge:
         merge_user_audio(folder)
-    
+
     # Set cooldown
     guild_cooldowns[guild.id] = time.time() + COOLDOWN_SECONDS
     print(f"✅ Cleanup done. Cooldown: {COOLDOWN_SECONDS}s")
@@ -297,47 +294,65 @@ async def leave_and_cleanup(guild):
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def monitor_channels():
     """Continuously checks all guilds for interesting channels"""
-    
+
     for guild in bot.guilds:
         vc = guild.voice_client
         guild_id = guild.id
         current_time = time.time()
-        
-        # Check if in cooldown
+
         in_cooldown = guild_id in guild_cooldowns and current_time < guild_cooldowns[guild_id]
-        
-        # Find interesting channel
         target_channel = find_interesting_channel(guild)
-        
+
         # --- SCENARIO 1: Bot is connected ---
         if vc and vc.channel:
-            # Check if current channel is still interesting
+
+            # Leave if no whitelisted user is present anymore
             if not is_channel_interesting(vc.channel):
-                print(f"Channel {vc.channel.name} became inactive")
+                print(f"No whitelisted users in {vc.channel.name}, leaving...")
                 await leave_and_cleanup(guild)
-            
-            # Check if recording is working (packet health)
+
+            # Check packet health — only restart if silence AND no whitelisted user is physically present
             elif guild_id in last_packet_time:
                 silence_duration = current_time - last_packet_time[guild_id]
-                if silence_duration > 10:
-                    print(f"No packets for {silence_duration:.0f}s, restarting listener...")
-                    try:
-                        vc.stop()
-                        await asyncio.sleep(0.5)
-                        vc.listen(voice_recv.BasicSink(callback_function))
+
+                if silence_duration > SILENCE_THRESHOLD:
+                    # Double-check: are whitelisted users still in the channel?
+                    # If yes, they're just quiet — don't restart, that's normal
+                    whitelisted_present = any(
+                        m.id in ALLOWED_USERS and not m.bot
+                        for m in vc.channel.members
+                    )
+
+                    if whitelisted_present:
+                        # Users are present but quiet — reset timer and wait
                         last_packet_time[guild_id] = current_time
-                        print("✅ Listener restarted")
-                    except Exception as e:
-                        print(f"❌ Restart failed: {e}, reconnecting...")
-                        await leave_and_cleanup(guild)
-                        if not in_cooldown:
-                            await join_channel(target_channel)
-        
+                        print(f"⏳ Silence for {silence_duration:.0f}s but whitelisted users still present, resetting timer...")
+                    else:
+                        # No whitelisted users physically in channel — attempt listener restart
+                        last_restart = last_restart_time.get(guild_id, 0)
+                        if current_time - last_restart < RESTART_COOLDOWN:
+                            remaining = RESTART_COOLDOWN - (current_time - last_restart)
+                            print(f"⏳ Silence detected but restart cooldown active ({remaining:.0f}s remaining), waiting...")
+                        else:
+                            print(f"No packets for {silence_duration:.0f}s and no whitelisted users present, restarting listener...")
+                            last_restart_time[guild_id] = current_time
+                            try:
+                                vc.stop()
+                                await asyncio.sleep(0.5)
+                                vc.listen(voice_recv.BasicSink(callback_function))
+                                last_packet_time[guild_id] = current_time
+                                print("✅ Listener restarted")
+                            except Exception as e:
+                                print(f"❌ Restart failed: {e}, reconnecting...")
+                                await leave_and_cleanup(guild)
+                                if target_channel and not in_cooldown:
+                                    await join_channel(target_channel)
+
         # --- SCENARIO 2: Bot is idle ---
         elif target_channel and not in_cooldown:
             print(f"Found active channel: {target_channel.name}")
             await join_channel(target_channel)
-        
+
         # Clean up expired cooldowns
         if in_cooldown and current_time >= guild_cooldowns[guild_id]:
             print(f"Cooldown expired for {guild.name}")
@@ -350,14 +365,12 @@ def save_whitelist_to_env():
     env_path = '.env'
     new_line = f"ALLOWED_USERS={','.join(str(uid) for uid in ALLOWED_USERS)}\n"
 
-    # Read existing .env content
     if os.path.exists(env_path):
         with open(env_path, 'r') as f:
             lines = f.readlines()
     else:
         lines = []
 
-    # Replace existing ALLOWED_USERS line, or append if not found
     found = False
     for i, line in enumerate(lines):
         if line.startswith('ALLOWED_USERS='):
@@ -386,7 +399,7 @@ async def unallow(ctx, user_id: int):
     if ALLOWED_USERS:
         await ctx.send(f"🗑️ User `{user_id}` removed and .env updated. ({len(ALLOWED_USERS)} user(s) remaining)")
     else:
-        await ctx.send(f"🗑️ User `{user_id}` removed and .env updated. Whitelist is now empty — recording **everyone**.")
+        await ctx.send(f"🗑️ User `{user_id}` removed and .env updated. Whitelist is now empty — **no one** will be recorded.")
 
 @bot.command()
 async def whitelist(ctx):
