@@ -73,6 +73,58 @@ def convert_and_delete_pcm(pcm_filename):
     )
     subprocess.Popen(cmd, shell=True)
 
+def startup_cleanup():
+    """
+    Runs once on bot startup before joining any VC.
+    - Creates Recordings/ folder if missing
+    - Scans all user subfolders for leftover .pcm and unmerged _part*.mp3 files
+    - Converts any .pcm files to .mp3 (blocking, so they're ready to merge)
+    - Merges all chunks into Full_Recording.mp3
+    - Leaves every folder in a clean state: only Full_Recording.mp3
+    """
+    print(f"🔍 Running startup cleanup on '{BASE_DIR}'...")
+
+    # Ensure base recordings folder exists
+    os.makedirs(BASE_DIR, exist_ok=True)
+
+    user_folders = [
+        os.path.join(BASE_DIR, d)
+        for d in os.listdir(BASE_DIR)
+        if os.path.isdir(os.path.join(BASE_DIR, d))
+    ]
+
+    if not user_folders:
+        print("   No existing user folders found. Starting fresh.")
+        return
+
+    for folder in user_folders:
+        folder_name = os.path.basename(folder)
+
+        # Step 1: Convert any leftover .pcm files to .mp3 (blocking)
+        pcm_files = glob.glob(os.path.join(folder, "*.pcm"))
+        for pcm in pcm_files:
+            mp3 = pcm.replace('.pcm', '.mp3')
+            print(f"   Converting leftover PCM: {os.path.basename(pcm)}")
+            result = subprocess.run(
+                f"ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"{pcm}\" \"{mp3}\" -loglevel error",
+                shell=True
+            )
+            if result.returncode == 0 and os.path.exists(mp3):
+                os.remove(pcm)
+            else:
+                print(f"   ⚠️ Failed to convert {os.path.basename(pcm)}, skipping.")
+
+        # Step 2: Merge any _part*.mp3 chunks into Full_Recording.mp3
+        chunks = sorted(glob.glob(os.path.join(folder, "*_part*.mp3")))
+        if chunks:
+            print(f"   Merging {len(chunks)} chunk(s) in '{folder_name}'...")
+            merge_user_audio(folder)
+            print(f"   ✅ '{folder_name}' cleaned up.")
+        else:
+            print(f"   ✅ '{folder_name}' already clean.")
+
+    print("✅ Startup cleanup complete. Ready to join VCs.")
+
 def merge_user_audio(folder_path):
     """Appends all new chunk files into a single persistent Full_Recording.mp3"""
     chunks = sorted(glob.glob(os.path.join(folder_path, "*_part*.mp3")))
@@ -118,6 +170,9 @@ def merge_user_audio(folder_path):
 def callback_function(user, data: voice_recv.VoiceData):
     """Runs continuously receiving audio packets"""
     if not data.pcm: return
+
+    # Guard: user may be None if Discord hasn't resolved the member yet
+    if user is None: return
 
     # ✅ User whitelist check — if whitelist is empty, record no one
     if not ALLOWED_USERS or user.id not in ALLOWED_USERS:
@@ -348,6 +403,7 @@ async def whitelist(ctx):
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print(f"Monitoring {len(bot.guilds)} servers every {CHECK_INTERVAL}s")
+    startup_cleanup()
     monitor_channels.start()
 
 # --- RUN ---
