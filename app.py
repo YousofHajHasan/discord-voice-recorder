@@ -1,12 +1,12 @@
 import discord
-from discord.ext import commands, voice_recv, tasks
+from discord.ext import commands, tasks
+from discord.sinks import MP3Sink, Filters, AudioData
 import os
 import time
 import asyncio
 import subprocess
 import glob
-
-# Trigger auto build
+import io
 
 # --- CONFIGURATION ---
 try:
@@ -19,9 +19,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHUNK_TIME = int(os.getenv('CHUNK_TIME', 300))
 BASE_DIR = os.getenv('BASE_DIR', 'Recordings')
 COOLDOWN_SECONDS = 10
-CHECK_INTERVAL = 3      # Check every 3 seconds
-SILENCE_THRESHOLD = 30  # Seconds of no packets before attempting a listener restart
-RESTART_COOLDOWN = 20   # Seconds to wait between listener restarts (prevents in/out loop)
+CHECK_INTERVAL = 3
 
 raw_allowed = os.getenv('ALLOWED_CHANNELS', '')
 if raw_allowed:
@@ -29,7 +27,6 @@ if raw_allowed:
 else:
     ALLOWED_CHANNELS = []
 
-# User Whitelist: Only record these user IDs (empty = record no one)
 raw_allowed_users = os.getenv('ALLOWED_USERS', '')
 if raw_allowed_users:
     ALLOWED_USERS = set(int(x.strip()) for x in raw_allowed_users.split(',') if x.strip().isdigit())
@@ -39,8 +36,6 @@ else:
 print(f"✅ Configuration Loaded:")
 print(f"   - Chunk Time: {CHUNK_TIME}s")
 print(f"   - Check Interval: {CHECK_INTERVAL}s")
-print(f"   - Silence Threshold: {SILENCE_THRESHOLD}s")
-print(f"   - Restart Cooldown: {RESTART_COOLDOWN}s")
 print(f"   - Channel Whitelist: {ALLOWED_CHANNELS if ALLOWED_CHANNELS else 'ALL CHANNELS'}")
 print(f"   - User Whitelist: {ALLOWED_USERS if ALLOWED_USERS else 'EMPTY (no one will be recorded)'}")
 
@@ -49,79 +44,28 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.voice_states = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # State Management
-user_sessions = {}
-guild_cooldowns = {}    # When each guild can rejoin after leaving
-last_packet_time = {}   # Last audio packet received per guild
-last_restart_time = {}  # Last listener restart per guild (enforces RESTART_COOLDOWN)
+guild_cooldowns = {}
+guild_chunk_tasks = {}  # Tracks the periodic chunk task per guild
 
 # --- HELPER FUNCTIONS ---
 
-def ensure_folder(user):
+def ensure_folder(user_id, user_name):
     """Creates a folder for the user: Recordings/Username_ID"""
-    safe_name = "".join(x for x in user.name if x.isalnum())
-    folder_path = os.path.join(BASE_DIR, f"{safe_name}_{user.id}")
+    safe_name = "".join(x for x in user_name if x.isalnum())
+    folder_path = os.path.join(BASE_DIR, f"{safe_name}_{user_id}")
     os.makedirs(folder_path, exist_ok=True)
     return folder_path
 
-def startup_cleanup():
-    """
-    Runs once on bot startup before joining any VC.
-    - Creates Recordings/ folder if missing
-    - Scans all user subfolders for leftover .pcm and unmerged _part*.mp3 files
-    - Converts any .pcm files to .mp3 (blocking, so they're ready to merge)
-    - Merges all chunks into Full_Recording.mp3
-    - Leaves every folder in a clean state: only Full_Recording.mp3
-    """
-    print(f"🔍 Running startup cleanup on '{BASE_DIR}'...")
-
-    os.makedirs(BASE_DIR, exist_ok=True)
-
-    user_folders = [
-        os.path.join(BASE_DIR, d)
-        for d in os.listdir(BASE_DIR)
-        if os.path.isdir(os.path.join(BASE_DIR, d))
-    ]
-
-    if not user_folders:
-        print("   No existing user folders found. Starting fresh.")
-        return
-
-    for folder in user_folders:
-        folder_name = os.path.basename(folder)
-
-        # Step 1: Convert any leftover .pcm files to .mp3 (blocking)
-        pcm_files = glob.glob(os.path.join(folder, "*.pcm"))
-        for pcm in pcm_files:
-            mp3 = pcm.replace('.pcm', '.mp3')
-            print(f"   Converting leftover PCM: {os.path.basename(pcm)}")
-            result = subprocess.run(
-                f"ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"{pcm}\" \"{mp3}\" -loglevel error",
-                shell=True
-            )
-            if result.returncode == 0 and os.path.exists(mp3):
-                os.remove(pcm)
-            else:
-                print(f"   ⚠️ Failed to convert {os.path.basename(pcm)}, skipping.")
-
-        # Step 2: Merge any _part*.mp3 chunks into Full_Recording.mp3
-        chunks = sorted(glob.glob(os.path.join(folder, "*_part*.mp3")))
-        if chunks:
-            print(f"   Merging {len(chunks)} chunk(s) in '{folder_name}'...")
-            merge_user_audio(folder)
-            print(f"   ✅ '{folder_name}' cleaned up.")
-        else:
-            print(f"   ✅ '{folder_name}' already clean.")
-
-    print("✅ Startup cleanup complete. Ready to join VCs.")
-
 def merge_user_audio(folder_path):
-    """Appends all new chunk files into a single persistent Full_Recording.mp3"""
+    """Appends all _part*.mp3 chunk files into a single persistent Full_Recording.mp3"""
     chunks = sorted(glob.glob(os.path.join(folder_path, "*_part*.mp3")))
-    if not chunks: return
+    if not chunks:
+        return
 
     master_file = os.path.join(folder_path, "Full_Recording.mp3")
     list_file = os.path.join(folder_path, "files_to_merge.txt")
@@ -140,289 +84,276 @@ def merge_user_audio(folder_path):
         for filepath in files_to_concat:
             f.write(f"file '{os.path.abspath(filepath)}'\n")
 
-    print(f"Appending {len(chunks)} chunk(s) into {master_file}...")
-
+    print(f"   Merging {len(chunks)} chunk(s) into {master_file}...")
     subprocess.run([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
         '-i', list_file, '-c', 'copy', master_file
     ], stderr=subprocess.DEVNULL)
 
     os.remove(list_file)
-
     if temp_master and os.path.exists(temp_master):
         os.remove(temp_master)
     for chunk in chunks:
         if os.path.exists(chunk):
             os.remove(chunk)
 
-# --- RECORDING SINK ---
-
-class RecordingSink(voice_recv.AudioSink):
+def startup_cleanup():
     """
-    Custom AudioSink that receives RAW OPUS packets (wants_opus=True),
-    completely bypassing the library's Opus decoder.
-    This eliminates OpusError: corrupted stream crashes entirely.
-    Each user's Opus packets are piped directly into a persistent ffmpeg
-    process which handles decoding + encoding to MP3 itself.
+    Runs once on startup before joining any VC.
+    - Creates Recordings/ if missing
+    - Converts leftover .pcm files to .mp3
+    - Merges unmerged chunks into Full_Recording.mp3
     """
+    print(f"🔍 Running startup cleanup on '{BASE_DIR}'...")
+    os.makedirs(BASE_DIR, exist_ok=True)
 
-    def wants_opus(self) -> bool:
-        return True  # Skip the broken library decoder, receive raw Opus
+    user_folders = [
+        os.path.join(BASE_DIR, d)
+        for d in os.listdir(BASE_DIR)
+        if os.path.isdir(os.path.join(BASE_DIR, d))
+    ]
 
-    def write(self, user, data: voice_recv.VoiceData):
-        # Guard: user may be None if Discord hasn't resolved the member yet
-        if user is None: return
+    if not user_folders:
+        print("   No existing folders found. Starting fresh.")
+        return
 
-        # User whitelist check
-        if not ALLOWED_USERS or user.id not in ALLOWED_USERS:
-            return
+    for folder in user_folders:
+        folder_name = os.path.basename(folder)
 
-        if not data.opus: return
-
-        # Update last packet timestamp
-        if hasattr(user, 'guild') and user.guild:
-            last_packet_time[user.guild.id] = time.time()
-
-        user_id = user.id
-        current_time = time.time()
-
-        # Start session + ffmpeg process if not already running
-        if user_id not in user_sessions:
-            folder = ensure_folder(user)
-            session = self._start_session(user, folder, current_time)
-            user_sessions[user_id] = session
-
-        session = user_sessions[user_id]
-
-        # Chunk timer: close current ffmpeg process, start a new one
-        if current_time - session['start_time'] > CHUNK_TIME:
-            self._rotate_chunk(user, session, current_time)
-
-        # Write raw Opus packet directly into ffmpeg's stdin
-        try:
-            if session['process'] and session['process'].stdin:
-                session['process'].stdin.write(data.opus)
-                session['process'].stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass  # ffmpeg process died, will be restarted on next packet
-
-    def _start_session(self, user, folder, current_time):
-        """Starts a new ffmpeg process for a user, writing directly to MP3."""
-        chunk_num = 1
-        mp3_filename = os.path.join(folder, f"{user.name}_part{chunk_num}.mp3")
-        process = self._spawn_ffmpeg(mp3_filename)
-        return {
-            'start_time': current_time,
-            'chunk_num': chunk_num,
-            'current_file': mp3_filename,
-            'folder': folder,
-            'user_name': user.name,
-            'process': process,
-        }
-
-    def _rotate_chunk(self, user, session, current_time):
-        """Closes current ffmpeg process and starts a fresh one for next chunk."""
-        self._close_process(session['process'])
-        session['chunk_num'] += 1
-        session['start_time'] = current_time
-        mp3_filename = os.path.join(session['folder'], f"{session['user_name']}_part{session['chunk_num']}.mp3")
-        session['current_file'] = mp3_filename
-        session['process'] = self._spawn_ffmpeg(mp3_filename)
-
-    def _spawn_ffmpeg(self, output_file):
-        """
-        Spawns an ffmpeg process that:
-        - Reads raw Opus packets from stdin
-        - Decodes them (ogg container wraps Opus for ffmpeg to understand)
-        - Encodes to MP3 and writes to output_file
-        """
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'ogg',        # ogg container (wraps raw opus packets)
-            '-i', 'pipe:0',     # read from stdin
-            '-c:a', 'libmp3lame',
-            '-ar', '48000',
-            '-ac', '2',
-            '-b:a', '128k',
-            '-loglevel', 'error',
-            output_file
-        ]
-        try:
-            return subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+        # Convert any leftover .pcm files (from old code)
+        for pcm in glob.glob(os.path.join(folder, "*.pcm")):
+            mp3 = pcm.replace('.pcm', '.mp3')
+            print(f"   Converting leftover PCM: {os.path.basename(pcm)}")
+            result = subprocess.run(
+                f"ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"{pcm}\" \"{mp3}\" -loglevel error",
+                shell=True
             )
+            if result.returncode == 0 and os.path.exists(mp3):
+                os.remove(pcm)
+            else:
+                print(f"   ⚠️ Failed to convert {os.path.basename(pcm)}, skipping.")
+
+        chunks = sorted(glob.glob(os.path.join(folder, "*_part*.mp3")))
+        if chunks:
+            print(f"   Merging chunks in '{folder_name}'...")
+            merge_user_audio(folder)
+            print(f"   ✅ '{folder_name}' cleaned up.")
+        else:
+            print(f"   ✅ '{folder_name}' already clean.")
+
+    print("✅ Startup cleanup complete. Ready to join VCs.")
+
+# --- CUSTOM SINK ---
+
+class WhitelistMP3Sink(MP3Sink):
+    """
+    Subclass of Pycord's MP3Sink that only writes audio data
+    for users in the ALLOWED_USERS whitelist.
+    All other users' audio is silently discarded.
+    """
+
+    @Filters.container
+    def write(self, data, user):
+        # user here is a user ID integer
+        if not ALLOWED_USERS or user not in ALLOWED_USERS:
+            return  # Silently discard non-whitelisted users
+
+        if user not in self.audio_data:
+            self.audio_data[user] = AudioData(io.BytesIO())
+
+        self.audio_data[user].write(data)
+
+# --- RECORDING CALLBACK ---
+
+async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk_num_map: dict):
+    """
+    Called by Pycord when stop_recording() is invoked.
+    Saves each whitelisted user's audio as a chunk MP3 file,
+    then merges all chunks into Full_Recording.mp3.
+    """
+    print(f"📼 Processing recordings for {guild.name}...")
+
+    folders_to_merge = set()
+
+    for user_id, audio in sink.audio_data.items():
+        member = guild.get_member(user_id)
+        user_name = member.name if member else str(user_id)
+
+        folder = ensure_folder(user_id, user_name)
+        chunk_num = chunk_num_map.get(user_id, 1)
+        chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}.mp3")
+
+        # Format audio to MP3 using Pycord's built-in ffmpeg pipeline
+        try:
+            sink.format_audio(audio)
+            audio.file.seek(0)
+            with open(chunk_file, 'wb') as f:
+                f.write(audio.file.read())
+            print(f"   ✅ Saved chunk for {user_name}: {os.path.basename(chunk_file)}")
         except Exception as e:
-            print(f"❌ Failed to spawn ffmpeg for {output_file}: {e}")
-            return None
+            print(f"   ❌ Failed to save audio for {user_name}: {e}")
+            continue
 
-    def _close_process(self, process):
-        """Gracefully closes an ffmpeg stdin so it finishes writing the file."""
-        if process and process.stdin:
-            try:
-                process.stdin.close()
-                process.wait(timeout=5)
-            except Exception:
-                process.kill()
+        folders_to_merge.add(folder)
 
-    def cleanup(self):
-        """Called when the sink is stopped — close all open ffmpeg processes."""
-        for uid, session in user_sessions.items():
-            self._close_process(session.get('process'))
+    # Merge chunks into Full_Recording.mp3
+    for folder in folders_to_merge:
+        merge_user_audio(folder)
+
+    print(f"✅ Recording processing done for {guild.name}")
 
 # --- CHANNEL LOGIC ---
 
 def is_channel_interesting(channel):
-    """Returns True if channel has an undeafened whitelisted user and is allowed."""
+    """Returns True if a whitelisted undeafened user is present and channel is allowed."""
     if not channel or not channel.members:
         return False
-
-    # Don't join if whitelist is empty
     if not ALLOWED_USERS:
         return False
-
-    # Channel whitelist check
     if ALLOWED_CHANNELS and channel.id not in ALLOWED_CHANNELS:
         return False
-
-    # Only join if at least one whitelisted user is present and undeafened
     for member in channel.members:
         if member.bot:
             continue
         if member.id in ALLOWED_USERS and not member.voice.self_deaf and not member.voice.deaf:
             return True
-
     return False
 
 def find_interesting_channel(guild):
-    """Finds first interesting channel in guild, or None"""
+    """Finds first interesting voice channel in guild, or None."""
     for channel in guild.voice_channels:
         if is_channel_interesting(channel):
             return channel
     return None
 
-async def join_channel(channel):
-    """Joins a voice channel and starts recording"""
+async def join_and_record(channel: discord.VoiceChannel):
+    """Joins a voice channel and starts recording."""
     try:
         print(f"Joining {channel.name} in {channel.guild.name}")
-        vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
-        vc.listen(RecordingSink())  # Raw Opus sink — no decoder, no OpusError
-        last_packet_time[channel.guild.id] = time.time()
+        vc = await channel.connect()
+
+        # chunk_num_map tracks which chunk number each user is on
+        chunk_num_map = {}
+
+        async def on_recording_done(sink, *args):
+            await recording_finished(sink, channel.guild, chunk_num_map)
+
+        vc.start_recording(
+            WhitelistMP3Sink(),
+            on_recording_done,
+            sync_start=True
+        )
+
+        # Store chunk_num_map on the vc object so monitor_channels can access it
+        vc._chunk_num_map = chunk_num_map
+        vc._chunk_start_time = time.time()
+
+        print(f"✅ Recording started in {channel.name}")
         return True
     except Exception as e:
         print(f"❌ Failed to join {channel.name}: {e}")
         return False
 
-async def leave_and_cleanup(guild):
-    """Leaves voice channel and processes recordings"""
+async def leave_and_cleanup(guild: discord.Guild):
+    """Stops recording, saves files, and disconnects."""
     vc = guild.voice_client
     if not vc:
         return
 
     print(f"Leaving {vc.channel.name} in {guild.name}")
 
-    vc.stop()
-    await vc.disconnect()
+    try:
+        vc.stop_recording()  # Triggers recording_finished callback
+    except Exception as e:
+        print(f"⚠️ Error stopping recording: {e}")
 
-    # Clear timers
-    last_packet_time.pop(guild.id, None)
-    last_restart_time.pop(guild.id, None)
+    await asyncio.sleep(3)  # Give callback time to finish saving files
 
-    # Close all open ffmpeg processes (they write directly to MP3, no PCM conversion needed)
-    folders_to_merge = set()
-    for uid, session in user_sessions.items():
-        process = session.get('process')
-        if process and process.stdin:
-            try:
-                process.stdin.close()
-                process.wait(timeout=5)
-            except Exception:
-                process.kill()
-        folders_to_merge.add(session['folder'])
+    try:
+        await vc.disconnect()
+    except Exception:
+        pass
 
-    user_sessions.clear()
-
-    # Wait a moment to ensure ffmpeg finishes writing
-    await asyncio.sleep(2)
-
-    # Merge MP3 chunks into Full_Recording.mp3
-    for folder in folders_to_merge:
-        merge_user_audio(folder)
-
-    # Set cooldown
     guild_cooldowns[guild.id] = time.time() + COOLDOWN_SECONDS
-    print(f"✅ Cleanup done. Cooldown: {COOLDOWN_SECONDS}s")
+    print(f"✅ Left {guild.name}. Cooldown: {COOLDOWN_SECONDS}s")
+
+# --- CHUNK ROTATION ---
+
+async def rotate_chunk(guild: discord.Guild):
+    """
+    Stops current recording, saves the chunk, then immediately starts a new one.
+    This creates the chunked recording effect without disconnecting.
+    """
+    vc = guild.voice_client
+    if not vc or not vc.recording:
+        return
+
+    print(f"🔄 Rotating chunk for {guild.name}...")
+
+    old_chunk_num_map = getattr(vc, '_chunk_num_map', {})
+
+    # Increment chunk numbers for all active users
+    new_chunk_num_map = {uid: num + 1 for uid, num in old_chunk_num_map.items()}
+    # For any new user not yet in the map, they'll start at 1 (handled in recording_finished)
+
+    async def on_chunk_done(sink, *args):
+        await recording_finished(sink, guild, old_chunk_num_map)
+
+    try:
+        vc.stop_recording()
+        await asyncio.sleep(2)  # Wait for chunk to finish saving
+
+        # Start fresh recording for next chunk
+        vc._chunk_num_map = new_chunk_num_map
+        vc._chunk_start_time = time.time()
+
+        async def on_recording_done(sink, *args):
+            await recording_finished(sink, guild, vc._chunk_num_map)
+
+        vc.start_recording(
+            WhitelistMP3Sink(),
+            on_recording_done,
+            sync_start=True
+        )
+        print(f"✅ Chunk rotated for {guild.name}")
+    except Exception as e:
+        print(f"❌ Chunk rotation failed for {guild.name}: {e}")
 
 # --- MAIN POLLING LOOP ---
 
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def monitor_channels():
-    """Continuously checks all guilds for interesting channels"""
-
+    """Continuously checks all guilds for interesting channels."""
     for guild in bot.guilds:
         vc = guild.voice_client
         guild_id = guild.id
         current_time = time.time()
 
         in_cooldown = guild_id in guild_cooldowns and current_time < guild_cooldowns[guild_id]
+
+        # Clean up expired cooldowns
+        if in_cooldown and current_time >= guild_cooldowns.get(guild_id, 0):
+            del guild_cooldowns[guild_id]
+            in_cooldown = False
+
         target_channel = find_interesting_channel(guild)
 
         # --- SCENARIO 1: Bot is connected ---
         if vc and vc.channel:
-
-            # Leave if no whitelisted user is present anymore
             if not is_channel_interesting(vc.channel):
                 print(f"No whitelisted users in {vc.channel.name}, leaving...")
                 await leave_and_cleanup(guild)
 
-            # Check packet health — only restart if silence AND no whitelisted user is physically present
-            elif guild_id in last_packet_time:
-                silence_duration = current_time - last_packet_time[guild_id]
-
-                if silence_duration > SILENCE_THRESHOLD:
-                    # Double-check: are whitelisted users still in the channel?
-                    # If yes, they're just quiet — don't restart, that's normal
-                    whitelisted_present = any(
-                        m.id in ALLOWED_USERS and not m.bot
-                        for m in vc.channel.members
-                    )
-
-                    if whitelisted_present:
-                        # Users are present but quiet — reset timer and wait
-                        last_packet_time[guild_id] = current_time
-                        print(f"⏳ Silence for {silence_duration:.0f}s but whitelisted users still present, resetting timer...")
-                    else:
-                        # No whitelisted users physically in channel — attempt listener restart
-                        last_restart = last_restart_time.get(guild_id, 0)
-                        if current_time - last_restart < RESTART_COOLDOWN:
-                            remaining = RESTART_COOLDOWN - (current_time - last_restart)
-                            print(f"⏳ Silence detected but restart cooldown active ({remaining:.0f}s remaining), waiting...")
-                        else:
-                            print(f"No packets for {silence_duration:.0f}s and no whitelisted users present, restarting listener...")
-                            last_restart_time[guild_id] = current_time
-                            try:
-                                vc.stop()
-                                await asyncio.sleep(0.5)
-                                vc.listen(RecordingSink())  # Raw Opus sink — no decoder, no OpusError
-                                last_packet_time[guild_id] = current_time
-                                print("✅ Listener restarted")
-                            except Exception as e:
-                                print(f"❌ Restart failed: {e}, reconnecting...")
-                                await leave_and_cleanup(guild)
-                                if target_channel and not in_cooldown:
-                                    await join_channel(target_channel)
+            # Check if it's time to rotate the chunk
+            elif hasattr(vc, '_chunk_start_time'):
+                elapsed = current_time - vc._chunk_start_time
+                if elapsed >= CHUNK_TIME:
+                    await rotate_chunk(guild)
 
         # --- SCENARIO 2: Bot is idle ---
         elif target_channel and not in_cooldown:
             print(f"Found active channel: {target_channel.name}")
-            await join_channel(target_channel)
-
-        # Clean up expired cooldowns
-        if in_cooldown and current_time >= guild_cooldowns[guild_id]:
-            print(f"Cooldown expired for {guild.name}")
-            del guild_cooldowns[guild_id]
+            await join_and_record(target_channel)
 
 # --- WHITELIST COMMANDS ---
 
@@ -455,7 +386,7 @@ async def allow(ctx, user_id: int):
     """Add a user ID to the recording whitelist. Usage: !allow 123456789"""
     ALLOWED_USERS.add(user_id)
     save_whitelist_to_env()
-    await ctx.send(f"✅ User `{user_id}` added to the recording whitelist and saved to .env. ({len(ALLOWED_USERS)} user(s) tracked)")
+    await ctx.send(f"✅ User `{user_id}` added to whitelist and saved to .env. ({len(ALLOWED_USERS)} user(s) tracked)")
 
 @bot.command()
 async def unallow(ctx, user_id: int):
@@ -465,16 +396,16 @@ async def unallow(ctx, user_id: int):
     if ALLOWED_USERS:
         await ctx.send(f"🗑️ User `{user_id}` removed and .env updated. ({len(ALLOWED_USERS)} user(s) remaining)")
     else:
-        await ctx.send(f"🗑️ User `{user_id}` removed and .env updated. Whitelist is now empty — **no one** will be recorded.")
+        await ctx.send(f"🗑️ User `{user_id}` removed. Whitelist is now empty — **no one** will be recorded.")
 
 @bot.command()
 async def whitelist(ctx):
     """Show the current user recording whitelist. Usage: !whitelist"""
     if not ALLOWED_USERS:
-        await ctx.send("📋 User whitelist is empty — **no one** is being recorded. Use `!allow <user_id>` to add someone.")
+        await ctx.send("📋 Whitelist is empty — **no one** is being recorded. Use `!allow <user_id>` to add someone.")
     else:
         ids = '\n'.join(f"• `{uid}`" for uid in ALLOWED_USERS)
-        await ctx.send(f"📋 **Currently recording only these users ({len(ALLOWED_USERS)} total):**\n{ids}")
+        await ctx.send(f"📋 **Recording only these users ({len(ALLOWED_USERS)} total):**\n{ids}")
 
 # --- BOT EVENTS ---
 
