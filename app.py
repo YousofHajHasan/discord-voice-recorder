@@ -97,7 +97,7 @@ def merge_user_audio(folder_path, date_str):
         for filepath in files_to_concat:
             f.write(f"file '{os.path.abspath(filepath)}'\n")
 
-    print(f"   Merging {len(chunks)} chunk(s) into {os.path.basename(daily_file)}...")
+    print(f"   Merging {len(chunks)} chunk(s) into {os.path.abspath(daily_file)}...")
     subprocess.run([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
         '-i', list_file, '-c', 'copy', daily_file
@@ -196,7 +196,7 @@ async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk
                 continue
             with open(chunk_file, 'wb') as f:
                 f.write(data)
-            print(f"   ✅ Saved chunk for {user_name}: {os.path.basename(chunk_file)}")
+            print(f"   ✅ Saved chunk for {user_name}: {os.path.abspath(chunk_file)}")
         except Exception as e:
             print(f"   ❌ Failed to save audio for {user_name}: {e}")
             continue
