@@ -219,12 +219,15 @@ async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk
             vc._chunk_num_map = new_chunk_num_map
             vc._chunk_start_time = time.time()
 
-            async def on_recording_done(sink, *args):
-                await recording_finished(sink, guild, vc._chunk_num_map, today_str())
+            # Use a factory to capture vc at this moment, avoiding stale closure issues
+            def make_callback(voice_client):
+                async def on_recording_done(sink, *args):
+                    await recording_finished(sink, guild, voice_client._chunk_num_map, today_str())
+                return on_recording_done
 
             vc.start_recording(
                 WhitelistMP3Sink(),
-                on_recording_done,
+                make_callback(vc),
                 sync_start=True
             )
             print(f"✅ Chunk rotated for {guild.name}")
@@ -273,12 +276,15 @@ async def join_and_record(channel: discord.VoiceChannel):
 
         chunk_num_map = {}
 
-        async def on_recording_done(sink, *args):
-            await recording_finished(sink, channel.guild, chunk_num_map, today_str())
+        # Use a factory to capture vc at this moment, avoiding stale closure issues
+        def make_callback(voice_client):
+            async def on_recording_done(sink, *args):
+                await recording_finished(sink, channel.guild, voice_client._chunk_num_map, today_str())
+            return on_recording_done
 
         vc.start_recording(
             WhitelistMP3Sink(),
-            on_recording_done,
+            make_callback(vc),
             sync_start=True
         )
 
@@ -494,7 +500,25 @@ async def monitor_channels():
             print(f"Found active channel: {target_channel.name}")
             await join_and_record(target_channel)
 
-# --- BOT EVENTS ---
+# --- GRACEFUL SHUTDOWN ---
+
+async def shutdown():
+    """Save all active recordings before shutting down."""
+    print("🛑 Shutting down, saving all active recordings...")
+    for guild in bot.guilds:
+        vc = guild.voice_client
+        if vc and vc.recording:
+            print(f"💾 Saving recording for {guild.name}...")
+            try:
+                vc.stop_recording()
+                await asyncio.sleep(3)
+            except Exception as e:
+                print(f"⚠️ Error saving on shutdown for {guild.name}: {e}")
+            try:
+                await vc.disconnect()
+            except Exception:
+                pass
+    print("✅ Shutdown complete.")
 
 @bot.event
 async def on_ready():
@@ -505,6 +529,9 @@ async def on_ready():
 
 # --- RUN ---
 if TOKEN:
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        asyncio.run(shutdown())
 else:
     print("❌ Error: DISCORD_TOKEN not found")
