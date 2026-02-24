@@ -50,19 +50,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # State Management
 guild_cooldowns = {}
-guild_chunk_tasks = {}  # Tracks the periodic chunk task per guild
+guild_chunk_tasks = {}
+
+# Tracks guilds that are currently saving after a forced disconnect
+# Maps guild_id -> channel_id to rejoin after saving is done
+guild_pending_rejoin = {}
 
 # --- HELPER FUNCTIONS ---
 
 def ensure_folder(user_id, user_name):
-    """Creates a folder for the user: Recordings/Username_ID"""
     safe_name = "".join(x for x in user_name if x.isalnum())
     folder_path = os.path.join(BASE_DIR, f"{safe_name}_{user_id}")
     os.makedirs(folder_path, exist_ok=True)
     return folder_path
 
 def merge_user_audio(folder_path):
-    """Appends all _part*.mp3 chunk files into a single persistent Full_Recording.mp3"""
     chunks = sorted(glob.glob(os.path.join(folder_path, "*_part*.mp3")))
     if not chunks:
         return
@@ -98,12 +100,6 @@ def merge_user_audio(folder_path):
             os.remove(chunk)
 
 def startup_cleanup():
-    """
-    Runs once on startup before joining any VC.
-    - Creates Recordings/ if missing
-    - Converts leftover .pcm files to .mp3
-    - Merges unmerged chunks into Full_Recording.mp3
-    """
     print(f"🔍 Running startup cleanup on '{BASE_DIR}'...")
     os.makedirs(BASE_DIR, exist_ok=True)
 
@@ -120,7 +116,6 @@ def startup_cleanup():
     for folder in user_folders:
         folder_name = os.path.basename(folder)
 
-        # Convert any leftover .pcm files (from old code)
         for pcm in glob.glob(os.path.join(folder, "*.pcm")):
             mp3 = pcm.replace('.pcm', '.mp3')
             print(f"   Converting leftover PCM: {os.path.basename(pcm)}")
@@ -146,21 +141,12 @@ def startup_cleanup():
 # --- CUSTOM SINK ---
 
 class WhitelistMP3Sink(MP3Sink):
-    """
-    Subclass of Pycord's MP3Sink that only writes audio data
-    for users in the ALLOWED_USERS whitelist.
-    All other users' audio is silently discarded.
-    """
-
     @Filters.container
     def write(self, data, user):
-        # user here is a user ID integer
         if not ALLOWED_USERS or user not in ALLOWED_USERS:
-            return  # Silently discard non-whitelisted users
-
+            return
         if user not in self.audio_data:
             self.audio_data[user] = AudioData(io.BytesIO())
-
         self.audio_data[user].write(data)
 
 # --- RECORDING CALLBACK ---
@@ -168,9 +154,8 @@ class WhitelistMP3Sink(MP3Sink):
 async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk_num_map: dict):
     """
     Called by Pycord when stop_recording() is invoked.
-    By this point, Pycord's cleanup() has already called format_audio() on all
-    audio data — so the audio in sink.audio_data is already formatted MP3 bytes.
-    We just need to read and save each user's file.
+    Saves each user's audio chunk, merges into Full_Recording.mp3,
+    then rejoins if this was triggered by a forced disconnect.
     """
     print(f"📼 Processing recordings for {guild.name}...")
 
@@ -184,7 +169,6 @@ async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk
         chunk_num = chunk_num_map.get(user_id, 1)
         chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}.mp3")
 
-        # Audio is already formatted MP3 — just seek and save
         try:
             audio.file.seek(0)
             data = audio.file.read()
@@ -200,16 +184,26 @@ async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk
 
         folders_to_merge.add(folder)
 
-    # Merge chunks into Full_Recording.mp3
     for folder in folders_to_merge:
         merge_user_audio(folder)
 
     print(f"✅ Recording processing done for {guild.name}")
 
+    # --- REJOIN AFTER FORCED DISCONNECT ---
+    # If this save was triggered by a forced disconnect, rejoin now that saving is complete
+    if guild.id in guild_pending_rejoin:
+        channel_id = guild_pending_rejoin.pop(guild.id)
+        channel = guild.get_channel(channel_id)
+        if channel and is_channel_interesting(channel):
+            print(f"🔁 Save complete. Rejoining {channel.name} in {guild.name}...")
+            await asyncio.sleep(1)
+            await join_and_record(channel)
+        else:
+            print(f"⚠️ Channel no longer active after save, skipping rejoin for {guild.name}")
+
 # --- CHANNEL LOGIC ---
 
 def is_channel_interesting(channel):
-    """Returns True if a whitelisted undeafened user is present and channel is allowed."""
     if not channel or not channel.members:
         return False
     if not ALLOWED_USERS:
@@ -224,19 +218,16 @@ def is_channel_interesting(channel):
     return False
 
 def find_interesting_channel(guild):
-    """Finds first interesting voice channel in guild, or None."""
     for channel in guild.voice_channels:
         if is_channel_interesting(channel):
             return channel
     return None
 
 async def join_and_record(channel: discord.VoiceChannel):
-    """Joins a voice channel and starts recording."""
     try:
         print(f"Joining {channel.name} in {channel.guild.name}")
         vc = await channel.connect()
 
-        # chunk_num_map tracks which chunk number each user is on
         chunk_num_map = {}
 
         async def on_recording_done(sink, *args):
@@ -248,7 +239,6 @@ async def join_and_record(channel: discord.VoiceChannel):
             sync_start=True
         )
 
-        # Store chunk_num_map on the vc object so monitor_channels can access it
         vc._chunk_num_map = chunk_num_map
         vc._chunk_start_time = time.time()
 
@@ -259,7 +249,6 @@ async def join_and_record(channel: discord.VoiceChannel):
         return False
 
 async def leave_and_cleanup(guild: discord.Guild):
-    """Stops recording, saves files, and disconnects."""
     vc = guild.voice_client
     if not vc:
         return
@@ -267,11 +256,11 @@ async def leave_and_cleanup(guild: discord.Guild):
     print(f"Leaving {vc.channel.name} in {guild.name}")
 
     try:
-        vc.stop_recording()  # Triggers recording_finished callback
+        vc.stop_recording()
     except Exception as e:
         print(f"⚠️ Error stopping recording: {e}")
 
-    await asyncio.sleep(3)  # Give callback time to finish saving files
+    await asyncio.sleep(3)
 
     try:
         await vc.disconnect()
@@ -284,10 +273,6 @@ async def leave_and_cleanup(guild: discord.Guild):
 # --- CHUNK ROTATION ---
 
 async def rotate_chunk(guild: discord.Guild):
-    """
-    Stops current recording, waits for the callback to finish saving the chunk,
-    then starts a fresh recording immediately. Does not disconnect.
-    """
     vc = guild.voice_client
     if not vc or not vc.recording:
         return
@@ -295,11 +280,8 @@ async def rotate_chunk(guild: discord.Guild):
     print(f"🔄 Rotating chunk for {guild.name}...")
 
     old_chunk_num_map = getattr(vc, '_chunk_num_map', {})
-
-    # Next chunk numbers = current + 1 for each known user
     new_chunk_num_map = {uid: num + 1 for uid, num in old_chunk_num_map.items()}
 
-    # Use an event to know when the callback is fully done before starting next chunk
     chunk_done_event = asyncio.Event()
 
     async def on_chunk_done(sink, *args):
@@ -309,13 +291,11 @@ async def rotate_chunk(guild: discord.Guild):
     try:
         vc.stop_recording()
 
-        # Wait for callback to fully finish (up to 30s)
         try:
             await asyncio.wait_for(chunk_done_event.wait(), timeout=30)
         except asyncio.TimeoutError:
             print(f"⚠️ Chunk callback timed out for {guild.name}, continuing anyway...")
 
-        # Start fresh recording for next chunk
         vc._chunk_num_map = new_chunk_num_map
         vc._chunk_start_time = time.time()
 
@@ -331,19 +311,83 @@ async def rotate_chunk(guild: discord.Guild):
     except Exception as e:
         print(f"❌ Chunk rotation failed for {guild.name}: {e}")
 
+# --- FORCED DISCONNECT HANDLER ---
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """
+    Detects when the bot is forcibly disconnected from a voice channel.
+
+    Flow:
+      1. Bot gets kicked from VC
+      2. Save & merge the current chunk
+      3. Once saving is done, rejoin the same channel (if still active)
+    """
+    if member.id != bot.user.id:
+        return
+
+    # Bot was in a channel and is now gone
+    if before.channel and not after.channel:
+        guild = before.channel.guild
+        vc = guild.voice_client
+
+        print(f"⚠️ Bot was forcibly disconnected from {before.channel.name} in {guild.name}")
+
+        if vc and vc.recording:
+            print(f"💾 Saving current chunk before rejoining...")
+
+            # Mark this guild as pending rejoin — recording_finished will handle the rejoin
+            guild_pending_rejoin[guild.id] = before.channel.id
+
+            chunk_num_map = getattr(vc, '_chunk_num_map', {})
+            chunk_done_event = asyncio.Event()
+
+            async def on_forced_disconnect_save(sink, *args):
+                await recording_finished(sink, guild, chunk_num_map)
+                chunk_done_event.set()
+
+            try:
+                vc.stop_recording()
+
+                # Wait for save to complete before doing anything else
+                try:
+                    await asyncio.wait_for(chunk_done_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    print(f"⚠️ Save timed out for {guild.name}, attempting rejoin anyway...")
+                    channel_id = guild_pending_rejoin.pop(guild.id, None)
+                    if channel_id:
+                        channel = guild.get_channel(channel_id)
+                        if channel and is_channel_interesting(channel):
+                            await join_and_record(channel)
+
+            except Exception as e:
+                print(f"❌ Error during forced disconnect save for {guild.name}: {e}")
+                guild_pending_rejoin.pop(guild.id, None)
+
+        else:
+            # Not recording, just rejoin directly if channel is still active
+            print(f"🔁 Bot disconnected (not recording), rejoining {before.channel.name} if still active...")
+            await asyncio.sleep(2)
+            if is_channel_interesting(before.channel):
+                await join_and_record(before.channel)
+            else:
+                print(f"⚠️ Channel no longer active, not rejoining.")
+
 # --- MAIN POLLING LOOP ---
 
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def monitor_channels():
-    """Continuously checks all guilds for interesting channels."""
     for guild in bot.guilds:
         vc = guild.voice_client
         guild_id = guild.id
         current_time = time.time()
 
+        # Skip guilds mid-save after forced disconnect
+        if guild_id in guild_pending_rejoin:
+            continue
+
         in_cooldown = guild_id in guild_cooldowns and current_time < guild_cooldowns[guild_id]
 
-        # Clean up expired cooldowns
         if in_cooldown and current_time >= guild_cooldowns.get(guild_id, 0):
             del guild_cooldowns[guild_id]
             in_cooldown = False
@@ -356,7 +400,6 @@ async def monitor_channels():
                 print(f"No whitelisted users in {vc.channel.name}, leaving...")
                 await leave_and_cleanup(guild)
 
-            # Check if it's time to rotate the chunk
             elif hasattr(vc, '_chunk_start_time'):
                 elapsed = current_time - vc._chunk_start_time
                 if elapsed >= CHUNK_TIME:
@@ -370,7 +413,6 @@ async def monitor_channels():
 # --- WHITELIST COMMANDS ---
 
 def save_whitelist_to_env():
-    """Rewrites the ALLOWED_USERS line in the .env file to persist the current whitelist."""
     env_path = '.env'
     new_line = f"ALLOWED_USERS={','.join(str(uid) for uid in ALLOWED_USERS)}\n"
 
@@ -395,14 +437,12 @@ def save_whitelist_to_env():
 
 @bot.command()
 async def allow(ctx, user_id: int):
-    """Add a user ID to the recording whitelist. Usage: !allow 123456789"""
     ALLOWED_USERS.add(user_id)
     save_whitelist_to_env()
     await ctx.send(f"✅ User `{user_id}` added to whitelist and saved to .env. ({len(ALLOWED_USERS)} user(s) tracked)")
 
 @bot.command()
 async def unallow(ctx, user_id: int):
-    """Remove a user ID from the recording whitelist. Usage: !unallow 123456789"""
     ALLOWED_USERS.discard(user_id)
     save_whitelist_to_env()
     if ALLOWED_USERS:
@@ -412,7 +452,6 @@ async def unallow(ctx, user_id: int):
 
 @bot.command()
 async def whitelist(ctx):
-    """Show the current user recording whitelist. Usage: !whitelist"""
     if not ALLOWED_USERS:
         await ctx.send("📋 Whitelist is empty — **no one** is being recorded. Use `!allow <user_id>` to add someone.")
     else:
