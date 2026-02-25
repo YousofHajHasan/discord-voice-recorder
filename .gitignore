@@ -5,3 +5,6 @@ Recordings/
 bot_recordings/
 venv/
 .DS_Store
+test.py
+test.ipynb
+silero_vad.onnx

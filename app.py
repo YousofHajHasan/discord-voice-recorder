@@ -58,6 +58,30 @@ guild_pending_rejoin = {}
 # Maps guild_id -> True: start next chunk recording after current save finishes
 guild_pending_chunk_rotate = {}
 
+# Maps user_id -> timestamp when pause expires
+user_paused_until = {}
+
+# --- PAUSE HELPERS ---
+
+def is_user_paused(user_id: int) -> bool:
+    """Returns True if the user is currently paused."""
+    expiry = user_paused_until.get(user_id)
+    if expiry is None:
+        return False
+    if time.time() < expiry:
+        return True
+    # Pause expired — clean up
+    del user_paused_until[user_id]
+    return False
+
+def pause_user(user_id: int, minutes: int):
+    """Pauses recording for a user for the given number of minutes."""
+    user_paused_until[user_id] = time.time() + minutes * 60
+
+def unpause_user(user_id: int):
+    """Removes any active pause for a user."""
+    user_paused_until.pop(user_id, None)
+
 # --- HELPER FUNCTIONS ---
 
 def today_str():
@@ -158,11 +182,14 @@ def startup_cleanup():
 # --- CUSTOM SINK ---
 
 class WhitelistMP3Sink(MP3Sink):
-    """Only records audio for users in ALLOWED_USERS."""
+    """Only records audio for users in ALLOWED_USERS who are not paused."""
 
     @Filters.container
     def write(self, data, user):
+        # Skip if user is not whitelisted or is currently paused
         if not ALLOWED_USERS or user not in ALLOWED_USERS:
+            return
+        if is_user_paused(user):
             return
         if user not in self.audio_data:
             self.audio_data[user] = AudioData(io.BytesIO())
@@ -247,7 +274,10 @@ async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk
 # --- CHANNEL LOGIC ---
 
 def is_channel_interesting(channel):
-    """Returns True if a whitelisted undeafened user is present and channel is allowed."""
+    """
+    Returns True if a whitelisted, undeafened, and non-paused user is present
+    and the channel is allowed.
+    """
     if not channel or not channel.members:
         return False
     if not ALLOWED_USERS:
@@ -257,7 +287,12 @@ def is_channel_interesting(channel):
     for member in channel.members:
         if member.bot:
             continue
-        if member.id in ALLOWED_USERS and not member.voice.self_deaf and not member.voice.deaf:
+        if (
+            member.id in ALLOWED_USERS
+            and not member.voice.self_deaf
+            and not member.voice.deaf
+            and not is_user_paused(member.id)
+        ):
             return True
     return False
 
@@ -409,6 +444,130 @@ async def stop(ctx):
         print(f"❌ !stop command failed for {guild.name}: {e}")
         guild_pending_rejoin.pop(guild.id, None)
         await ctx.send(f"❌ Something went wrong: {e}")
+
+# --- PAUSE COMMAND ---
+
+async def flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
+    """
+    Immediately saves whatever audio has been buffered for a user in the
+    current active sink, then clears their buffer so future packets start fresh.
+    Called before pausing to preserve the half-chunk already recorded.
+    """
+    vc = guild.voice_client
+    if not vc or not vc.recording:
+        return
+
+    sink = vc.sink
+    if not sink or user_id not in sink.audio_data:
+        return  # Nothing buffered yet for this user
+
+    audio = sink.audio_data[user_id]
+
+    try:
+        audio.file.seek(0)
+        data = audio.file.read()
+        if not data:
+            return
+
+        folder = ensure_folder(user_id, user_name)
+        chunk_num = getattr(vc, '_chunk_num_map', {}).get(user_id, 1)
+        chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}_pre_pause.mp3")
+
+        with open(chunk_file, 'wb') as f:
+            f.write(data)
+
+        print(f"   💾 Pre-pause flush saved for {user_name}: {os.path.abspath(chunk_file)}")
+
+        # Merge this fragment into the daily file immediately
+        merge_user_audio(folder, today_str())
+
+        # Clear the buffer so the sink starts fresh after unpause
+        sink.audio_data[user_id] = AudioData(io.BytesIO())
+
+        # Bump chunk number so the next chunk doesn't collide
+        if hasattr(vc, '_chunk_num_map'):
+            vc._chunk_num_map[user_id] = chunk_num + 1
+
+    except Exception as e:
+        print(f"   ❌ Pre-pause flush failed for {user_name}: {e}")
+
+
+@bot.command()
+async def pause(ctx, minutes: int = None):
+    """
+    Pause recording yourself for a given number of minutes.
+    Usage: !pause 30
+    Only whitelisted users can pause themselves.
+    """
+    if ctx.author.id not in ALLOWED_USERS:
+        await ctx.send("⛔ You are not allowed to use this command.")
+        return
+
+    if minutes is None or minutes <= 0:
+        await ctx.send("⚠️ Please provide a valid number of minutes. Usage: `!pause 30`")
+        return
+
+    user_id = ctx.author.id
+    user_name = "".join(x for x in ctx.author.name if x.isalnum())
+
+    # Flush whatever audio is already buffered BEFORE activating the pause,
+    # so the half-chunk recorded so far is not lost.
+    await flush_user_audio(ctx.guild, user_id, user_name)
+
+    pause_user(user_id, minutes)
+
+    expiry_time = user_paused_until[user_id]
+    resume_at = datetime.fromtimestamp(expiry_time).strftime("%H:%M:%S")
+
+    await ctx.send(
+        f"⏸️ **{ctx.author.display_name}**, your recording is paused for **{minutes} minute(s)**. "
+        f"Recording resumes automatically at **{resume_at}**.\n"
+        f"Use `!unpause` to resume earlier."
+    )
+    print(f"⏸️ {ctx.author.name} ({user_id}) paused recording for {minutes} min.")
+
+@bot.command(name="continue")
+async def continue_recording(ctx):
+    """
+    Alias for !unpause — resume recording yourself before the pause expires.
+    Usage: !continue
+    Only works if you are currently paused.
+    """
+    if ctx.author.id not in ALLOWED_USERS:
+        await ctx.send("⛔ You are not allowed to use this command.")
+        return
+
+    user_id = ctx.author.id
+
+    if not is_user_paused(user_id):
+        await ctx.send(f"▶️ **{ctx.author.display_name}**, you are not currently paused.")
+        return
+
+    unpause_user(user_id)
+    await ctx.send(f"▶️ **{ctx.author.display_name}**, your recording has been resumed.")
+    print(f"▶️ {ctx.author.name} ({user_id}) resumed via !continue.")
+
+
+@bot.command()
+async def unpause(ctx):
+    """
+    Resume recording yourself before the pause expires.
+    Usage: !unpause
+    Only whitelisted users can unpause themselves.
+    """
+    if ctx.author.id not in ALLOWED_USERS:
+        await ctx.send("⛔ You are not allowed to use this command.")
+        return
+
+    user_id = ctx.author.id
+
+    if not is_user_paused(user_id):
+        await ctx.send(f"▶️ **{ctx.author.display_name}**, you are not currently paused.")
+        return
+
+    unpause_user(user_id)
+    await ctx.send(f"▶️ **{ctx.author.display_name}**, your recording has been resumed.")
+    print(f"▶️ {ctx.author.name} ({user_id}) manually unpaused.")
 
 # --- WHITELIST COMMANDS ---
 
