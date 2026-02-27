@@ -22,7 +22,7 @@ BASE_DIR = os.getenv('BASE_DIR', 'Recordings')
 COOLDOWN_SECONDS = 10
 CHECK_INTERVAL = 3
 
-raw_allowed = os.getenv('ALLOWED_CHANNELS', '')
+raw_allowed = os.getenv('ALLOWED_CHANNELS', '') # Hello Debug..
 if raw_allowed:
     ALLOWED_CHANNELS = [int(x.strip()) for x in raw_allowed.split(',') if x.strip().isdigit()]
 else:
