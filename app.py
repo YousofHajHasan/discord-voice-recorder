@@ -11,6 +11,9 @@ import io
 from datetime import datetime
 from enum import Enum, auto
 
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
