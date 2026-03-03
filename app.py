@@ -503,6 +503,7 @@ async def on_voice_state_update(member, before, after):
     """
     if member.id != bot.user.id:
         return
+    print(f"[DEBUG] before.channel={before.channel} after.channel={after.channel} state={get_state(member.guild.id).name}")
     if not (before.channel and not after.channel):
         return  # Not a disconnect
 
