@@ -1,4 +1,5 @@
 import discord
+import sys
 from discord.ext import commands, tasks
 from discord.sinks import MP3Sink, Filters, AudioData
 import os
@@ -620,6 +621,32 @@ async def whitelist(ctx):
     else:
         ids = '\n'.join(f"• `{uid}`" for uid in ALLOWED_USERS)
         await ctx.send(f"📋 **Recording only these users ({len(ALLOWED_USERS)} total):**\n{ids}")
+
+@bot.command()
+async def restart(ctx):
+    """Restarts the bot process. Only whitelisted users."""
+    if ctx.author.id not in ALLOWED_USERS:
+        await ctx.send("⛔ You are not allowed to use this command.")
+        return
+
+    await ctx.send("🔄 Restarting...")
+    print("🔄 Restart requested via Discord command.")
+
+    for guild in bot.guilds:
+        vc = guild.voice_client
+        if vc and vc.is_connected() and vc.recording:
+            try:
+                vc.stop_recording()
+                await asyncio.sleep(3)
+            except Exception:
+                pass
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+
+    await bot.close()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # --- MAIN POLLING LOOP ---
 
