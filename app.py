@@ -240,7 +240,7 @@ async def recording_finished(sink: WhitelistMP3Sink, guild: discord.Guild, chunk
     if guild.id in guild_pending_chunk_rotate:
         del guild_pending_chunk_rotate[guild.id]
         vc = guild.voice_client
-        if vc and vc.channel:
+        if vc and vc.is_connected() and vc.channel:
             print(f"🔄 Starting next chunk for {guild.name}...")
             new_chunk_num_map = {uid: num + 1 for uid, num in chunk_num_map.items()}
             vc._chunk_num_map = new_chunk_num_map
@@ -335,7 +335,7 @@ async def join_and_record(channel: discord.VoiceChannel):
 async def leave_and_cleanup(guild: discord.Guild):
     """Stops recording, saves files, and disconnects."""
     vc = guild.voice_client
-    if not vc:
+    if not vc or not vc.is_connected():
         return
 
     print(f"Leaving {vc.channel.name} in {guild.name}")
@@ -348,7 +348,7 @@ async def leave_and_cleanup(guild: discord.Guild):
     await asyncio.sleep(3)
 
     try:
-        await vc.disconnect()
+        await vc.disconnect(force=True)
     except Exception:
         pass
 
@@ -364,7 +364,7 @@ async def rotate_chunk(guild: discord.Guild):
     only after saving is fully done — no timeouts, no race conditions.
     """
     vc = guild.voice_client
-    if not vc or not vc.recording:
+    if not vc or not vc.is_connected() or not vc.recording:
         return
 
     print(f"🔄 Rotating chunk for {guild.name}...")
@@ -422,7 +422,7 @@ async def stop(ctx):
     guild = ctx.guild
     vc = guild.voice_client
 
-    if not vc or not vc.channel:
+    if not vc or not vc.is_connected() or not vc.channel:
         await ctx.send("⚠️ I'm not in a voice channel right now.")
         return
 
@@ -437,7 +437,7 @@ async def stop(ctx):
         vc.stop_recording()
         await asyncio.sleep(1)
         try:
-            await vc.disconnect()
+            await vc.disconnect(force=True)
         except Exception:
             pass
     except Exception as e:
@@ -454,7 +454,7 @@ async def flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
     Called before pausing to preserve the half-chunk already recorded.
     """
     vc = guild.voice_client
-    if not vc or not vc.recording:
+    if not vc or not vc.is_connected() or not vc.recording:
         return
 
     sink = vc.sink
@@ -635,16 +635,16 @@ async def monitor_channels():
         if guild_id in guild_pending_rejoin or guild_id in guild_pending_chunk_rotate:
             continue
 
-        in_cooldown = guild_id in guild_cooldowns and current_time < guild_cooldowns[guild_id]
-
-        if in_cooldown and current_time >= guild_cooldowns.get(guild_id, 0):
+        # Clean up expired cooldowns before evaluating
+        if guild_id in guild_cooldowns and current_time >= guild_cooldowns[guild_id]:
             del guild_cooldowns[guild_id]
-            in_cooldown = False
+
+        in_cooldown = guild_id in guild_cooldowns  # Check AFTER cleanup
 
         target_channel = find_interesting_channel(guild)
 
         # --- SCENARIO 1: Bot is connected ---
-        if vc and vc.channel:
+        if vc and vc.is_connected() and vc.channel:
             if not is_channel_interesting(vc.channel):
                 print(f"No whitelisted users in {vc.channel.name}, leaving...")
                 await leave_and_cleanup(guild)
@@ -666,7 +666,7 @@ async def shutdown():
     print("🛑 Shutting down, saving all active recordings...")
     for guild in bot.guilds:
         vc = guild.voice_client
-        if vc and vc.recording:
+        if vc and vc.is_connected() and vc.recording:
             print(f"💾 Saving recording for {guild.name}...")
             try:
                 vc.stop_recording()
@@ -674,7 +674,7 @@ async def shutdown():
             except Exception as e:
                 print(f"⚠️ Error saving on shutdown for {guild.name}: {e}")
             try:
-                await vc.disconnect()
+                await vc.disconnect(force=True)
             except Exception:
                 pass
     print("✅ Shutdown complete.")
