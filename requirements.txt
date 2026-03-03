@@ -1,2 +1,3 @@
-py-cord[voice]
+git+https://github.com/DA-344/pycord.git@feat/voice-rewrite-and-fixes#egg=py-cord[voice]
+davey
 pynacl
