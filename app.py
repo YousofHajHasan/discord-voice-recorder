@@ -1,6 +1,14 @@
+"""
+Discord Voice Recording Bot
+Compatible with: py-cord DA-344/feat/voice-rewrite-and-fixes (DAVE support branch)
+Install:
+    pip install "py-cord[voice] @ git+https://github.com/DA-344/pycord.git@feat/voice-rewrite-and-fixes"
+    pip install davey
+"""
+
 import discord
 from discord.ext import commands, tasks
-from discord.sinks import MP3Sink, Filters, AudioData
+from discord.sinks import Sink, AudioData, Filters
 import os
 import sys
 import time
@@ -10,9 +18,6 @@ import glob
 import io
 from datetime import datetime
 from enum import Enum, auto
-
-import logging
-logging.basicConfig(level=logging.DEBUG)
 
 # ==============================================================================
 # CONFIGURATION
@@ -27,8 +32,8 @@ except ImportError:
 TOKEN           = os.getenv('DISCORD_TOKEN')
 CHUNK_SECONDS   = int(os.getenv('CHUNK_TIME', 300))
 BASE_DIR        = os.getenv('BASE_DIR', 'recordings')
-CHECK_INTERVAL  = 3   # seconds between monitor ticks
-LEAVE_COOLDOWN  = 10  # seconds before rejoining after a leave
+CHECK_INTERVAL  = 3
+LEAVE_COOLDOWN  = 10
 
 raw_channels = os.getenv('ALLOWED_CHANNELS', '')
 ALLOWED_CHANNELS: list = (
@@ -58,10 +63,9 @@ class State(Enum):
     RECORDING = auto()   # In a VC and actively recording.
     SAVING    = auto()   # stop_recording() fired; waiting for callback to finish.
 
-# Per-guild state. Keyed by guild_id.
-guild_state:       dict = {}   # guild_id -> State
-guild_cooldown:    dict = {}   # guild_id -> timestamp when cooldown expires
-user_paused_until: dict = {}   # user_id  -> timestamp when pause expires
+guild_state:       dict = {}
+guild_cooldown:    dict = {}
+user_paused_until: dict = {}
 
 def get_state(guild_id: int) -> State:
     return guild_state.get(guild_id, State.IDLE)
@@ -115,10 +119,7 @@ def user_folder(user_id: int, user_name: str) -> str:
     return path
 
 def merge_chunks(folder: str, date_str: str):
-    """
-    Concatenates all *_part*.mp3 files in folder into YYYY-MM-DD.mp3,
-    then deletes the part files.
-    """
+    """Concatenates all *_part*.mp3 files into YYYY-MM-DD.mp3, then deletes parts."""
     chunks = sorted(glob.glob(os.path.join(folder, "*_part*.mp3")))
     if not chunks:
         return
@@ -127,7 +128,6 @@ def merge_chunks(folder: str, date_str: str):
     list_file  = os.path.join(folder, "_merge_list.txt")
     temp_file  = os.path.join(folder, f"_temp_{date_str}.mp3")
 
-    # If a daily file already exists, prepend it
     concat_inputs = []
     if os.path.exists(daily_file):
         os.rename(daily_file, temp_file)
@@ -153,10 +153,7 @@ def merge_chunks(folder: str, date_str: str):
             os.remove(chunk)
 
 def startup_cleanup():
-    """
-    On startup: convert leftover .pcm files and merge any unmerged chunks.
-    Runs before the monitor loop starts.
-    """
+    """On startup: merge any unmerged chunks from previous sessions."""
     print(f"🔍 Startup cleanup on '{BASE_DIR}'...")
     os.makedirs(BASE_DIR, exist_ok=True)
 
@@ -171,21 +168,6 @@ def startup_cleanup():
 
     for folder in folders:
         name = os.path.basename(folder)
-
-        # Convert leftover raw PCM
-        for pcm in glob.glob(os.path.join(folder, "*.pcm")):
-            mp3 = pcm.replace('.pcm', '.mp3')
-            print(f"   Converting leftover PCM: {os.path.basename(pcm)}")
-            result = subprocess.run(
-                f'ffmpeg -y -f s16le -ar 48000 -ac 2 -i "{pcm}" "{mp3}" -loglevel error',
-                shell=True
-            )
-            if result.returncode == 0 and os.path.exists(mp3):
-                os.remove(pcm)
-            else:
-                print(f"   ⚠️  Failed to convert {os.path.basename(pcm)}, skipping.")
-
-        # Merge leftover chunks
         if glob.glob(os.path.join(folder, "*_part*.mp3")):
             print(f"   Merging chunks in '{name}'...")
             merge_chunks(folder, today_str())
@@ -199,8 +181,13 @@ def startup_cleanup():
 # CUSTOM SINK  (whitelist + pause filter)
 # ==============================================================================
 
-class WhitelistMP3Sink(MP3Sink):
-    """Records only whitelisted, non-paused users."""
+class WhitelistMP3Sink(Sink):
+    """
+    Records only whitelisted, non-paused users.
+    Extends the base Sink class from the new voice rewrite branch.
+    Audio data arrives already decrypted (including DAVE) by the time
+    write() is called — no changes needed here for DAVE support.
+    """
 
     @Filters.container
     def write(self, data, user):
@@ -212,25 +199,57 @@ class WhitelistMP3Sink(MP3Sink):
             self.audio_data[user] = AudioData(io.BytesIO())
         self.audio_data[user].write(data)
 
+    def format_audio(self, audio: AudioData):
+        """
+        Called by the base Sink during cleanup() for each AudioData.
+        Converts raw PCM stored in the BytesIO to MP3 via ffmpeg.
+        """
+        audio.file.seek(0)
+        raw = audio.file.read()
+        if not raw:
+            return
+
+        process = subprocess.Popen(
+            ['ffmpeg', '-y',
+             '-f', 's16le', '-ar', '48000', '-ac', '2',
+             '-i', 'pipe:0',
+             '-f', 'mp3', 'pipe:1'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+        mp3_data, _ = process.communicate(input=raw)
+
+        audio.file = io.BytesIO(mp3_data)
+        audio.file.seek(0)
+
 # ==============================================================================
 # RECORDING SESSION
-#
-# Encapsulates everything about one continuous stay in a VC.
-# Created when the bot joins, destroyed when the bot leaves.
-# The monitor loop is the ONLY place that creates a RecordingSession.
 # ==============================================================================
 
 class RecordingSession:
+    """
+    Encapsulates one continuous stay in a VC.
+    Created when the bot joins, destroyed when it leaves.
+    The monitor loop is the ONLY place that creates a RecordingSession.
+
+    New API changes (DA-344 branch):
+    - start_recording(sink, callback) — callback is now `def cb(error)`, sink NOT passed
+    - stop_recording() — raises RecordingException if not recording
+    - vc.is_recording() — replaces vc.recording property
+    - Sink is stored on self.sink so we can access it in the callback
+    """
 
     def __init__(self, vc: discord.VoiceClient):
         self.vc          = vc
         self.guild       = vc.guild
+        self.sink        = WhitelistMP3Sink()   # stored here — callback no longer receives it
         self.chunk_num   = 1
         self.chunk_start = time.time()
         self.date_str    = today_str()
 
     # ------------------------------------------------------------------
-    # Save all audio in a finished sink to disk, then merge per user.
+    # Save all audio from a finished sink to disk, then merge per user.
     # ------------------------------------------------------------------
     def _save_sink(self, sink: WhitelistMP3Sink):
         saved_folders = set()
@@ -263,95 +282,92 @@ class RecordingSession:
     # Begin recording on the voice client.
     # ------------------------------------------------------------------
     def start(self):
+        self.sink        = WhitelistMP3Sink()
         self.chunk_start = time.time()
         self.date_str    = today_str()
 
-        async def _callback(sink: WhitelistMP3Sink, *args):
-            await self._on_stop(sink)
+        # Callback now only receives `error` — sink accessed via self.sink
+        def _callback(error: Exception | None):
+            if error:
+                print(f"   ❌ Recording error: {error}")
+            asyncio.run_coroutine_threadsafe(
+                self._on_stop(), bot.loop
+            )
 
-        self.vc.start_recording(
-            WhitelistMP3Sink(),
-            _callback,
-            sync_start=True
-        )
+        self.vc.start_recording(self.sink, _callback)
         print(f"▶️  Recording started — '{self.vc.channel.name}' chunk {self.chunk_num}")
 
     # ------------------------------------------------------------------
-    # Called by pycord when stop_recording() finishes.
-    # Saves the chunk, then transitions state back to IDLE.
-    # The monitor loop takes over from IDLE.
+    # Called after stop_recording() finishes — saves chunk, sets IDLE.
     # ------------------------------------------------------------------
-    async def _on_stop(self, sink: WhitelistMP3Sink):
+    async def _on_stop(self):
         print(f"💾 Processing chunk {self.chunk_num} for '{self.guild.name}'...")
-        self._save_sink(sink)
+        self._save_sink(self.sink)
         print(f"✅ Chunk {self.chunk_num} done.")
         set_state(self.guild.id, State.IDLE)
 
     # ------------------------------------------------------------------
-    # Rotate: stop current chunk, save it, start next chunk immediately.
-    # Uses a dedicated callback so the next chunk begins inside the save.
+    # Rotate: stop current chunk, save, start next chunk immediately.
     # ------------------------------------------------------------------
     async def rotate(self):
-        if not self.vc.recording:
+        if not self.vc.is_recording():
             return
 
-        current_chunk = self.chunk_num
+        current_chunk    = self.chunk_num
+        current_sink     = self.sink
         print(f"🔄 Rotating chunk {current_chunk} in '{self.guild.name}'...")
         set_state(self.guild.id, State.SAVING)
 
-        async def _rotate_callback(sink: WhitelistMP3Sink, *args):
-            print(f"💾 Saving chunk {current_chunk} for '{self.guild.name}'...")
-            self._save_sink(sink)
-            print(f"✅ Chunk {current_chunk} saved.")
+        def _rotate_callback(error: Exception | None):
+            if error:
+                print(f"   ❌ Rotate recording error: {error}")
+            asyncio.run_coroutine_threadsafe(
+                self._on_rotate_done(current_sink, current_chunk), bot.loop
+            )
 
-            self.chunk_num  += 1
-            self.chunk_start = time.time()
-            self.date_str    = today_str()
-
-            if self.vc.is_connected():
-                # Start next chunk with the regular stop callback
-                async def _next_callback(s: WhitelistMP3Sink, *a):
-                    await self._on_stop(s)
-
-                self.vc.start_recording(
-                    WhitelistMP3Sink(),
-                    _next_callback,
-                    sync_start=True
-                )
-                set_state(self.guild.id, State.RECORDING)
-                print(f"▶️  Chunk {self.chunk_num} started in '{self.vc.channel.name}'")
-            else:
-                # Lost connection during save — go idle, monitor will rejoin
-                set_state(self.guild.id, State.IDLE)
-
-        # Swap the active callback by starting fresh with _rotate_callback.
-        # We have to stop first, then the callback fires.
-        try:
-            # Patch: pycord's start_recording stores callback on the voice client.
-            # Calling stop_recording() fires whatever callback was registered last.
-            # So we re-register _rotate_callback before stopping.
-            self.vc._recording_finished = _rotate_callback  # internal pycord attribute
-        except Exception:
-            pass  # If patching fails we fall back gracefully
+        # Prepare next sink before stopping so it's ready immediately
+        self.chunk_num  += 1
+        self.chunk_start = time.time()
+        self.date_str    = today_str()
+        self.sink        = WhitelistMP3Sink()
 
         try:
             self.vc.stop_recording()
         except Exception as e:
-            print(f"❌ rotate() failed: {e}")
+            print(f"❌ rotate() stop_recording failed: {e}")
+            # Rollback
+            self.chunk_num  -= 1
+            self.chunk_start = time.time()
+            self.sink        = current_sink
             set_state(self.guild.id, State.RECORDING)
+            return
+
+        # Immediately start next chunk
+        if self.vc.is_connected():
+            self.vc.start_recording(self.sink, _rotate_callback)
+            set_state(self.guild.id, State.RECORDING)
+            print(f"▶️  Chunk {self.chunk_num} started in '{self.vc.channel.name}'")
+
+    async def _on_rotate_done(self, old_sink: WhitelistMP3Sink, chunk_num: int):
+        print(f"💾 Saving chunk {chunk_num} for '{self.guild.name}'...")
+        # Temporarily set chunk_num back to save with correct number
+        real_chunk_num  = self.chunk_num
+        self.chunk_num  = chunk_num
+        self._save_sink(old_sink)
+        self.chunk_num  = real_chunk_num
+        print(f"✅ Chunk {chunk_num} saved.")
 
     # ------------------------------------------------------------------
     # Stop: save chunk, disconnect, go IDLE.
-    # Called by !stop command and on_voice_state_update (kick).
     # ------------------------------------------------------------------
     async def stop(self, reason: str = "manual"):
         print(f"⏹️  Stopping session ({reason}) in '{self.guild.name}'...")
         set_state(self.guild.id, State.SAVING)
 
-        if self.vc.recording:
+        if self.vc.is_recording():
             try:
                 self.vc.stop_recording()
-                # _on_stop callback will fire and set state to IDLE
+                # _on_stop() callback will fire and set state to IDLE
             except Exception as e:
                 print(f"❌ stop_recording() error: {e}")
                 set_state(self.guild.id, State.IDLE)
@@ -378,7 +394,6 @@ active_sessions: dict = {}
 # ==============================================================================
 
 def channel_has_target(channel: discord.VoiceChannel) -> bool:
-    """True if at least one whitelisted, undeafened, non-paused user is present."""
     if not ALLOWED_USERS:
         return False
     if ALLOWED_CHANNELS and channel.id not in ALLOWED_CHANNELS:
@@ -405,13 +420,6 @@ def find_target_channel(guild: discord.Guild):
 
 # ==============================================================================
 # MONITOR LOOP
-#
-# The single source of truth for joining and leaving voice channels.
-# Every CHECK_INTERVAL seconds it evaluates each guild's state and acts.
-#
-#   IDLE    → look for a target channel → join → RECORDING
-#   SAVING  → do nothing, wait for callback
-#   RECORDING → check channel still has targets → rotate if chunk time reached
 # ==============================================================================
 
 @tasks.loop(seconds=CHECK_INTERVAL)
@@ -426,7 +434,7 @@ async def monitor():
         if gid in guild_cooldown and now >= guild_cooldown[gid]:
             del guild_cooldown[gid]
 
-        # Saving: wait for pycord callback to finish — do nothing
+        # Saving: wait for callback to finish
         if state == State.SAVING:
             continue
 
@@ -436,15 +444,15 @@ async def monitor():
         if state == State.RECORDING:
             session = active_sessions.get(gid)
 
-            # Pycord dropped the connection silently
+            # Silent disconnect
             if not vc or not vc.is_connected():
-                print(f"⚠️  Silent disconnect detected in '{guild.name}' — going IDLE.")
+                print(f"⚠️  Silent disconnect in '{guild.name}' — going IDLE.")
                 active_sessions.pop(gid, None)
                 set_state(gid, State.IDLE)
                 guild_cooldown[gid] = now + LEAVE_COOLDOWN
                 continue
 
-            # No more targets → leave
+            # No more targets
             if not channel_has_target(vc.channel):
                 print(f"No targets left in '{vc.channel.name}' — leaving.")
                 active_sessions.pop(gid, None)
@@ -452,7 +460,7 @@ async def monitor():
                     await session.stop(reason="no targets")
                 continue
 
-            # Chunk rotation time?
+            # Chunk rotation
             if session and (now - session.chunk_start) >= CHUNK_SECONDS:
                 await session.rotate()
 
@@ -461,13 +469,13 @@ async def monitor():
         # --------------------------------------------------------------
         elif state == State.IDLE:
             if gid in guild_cooldown:
-                continue  # Still cooling down
+                continue
 
             target = find_target_channel(guild)
             if not target:
-                continue  # Nothing interesting
+                continue
 
-            # Clean up any stale voice client
+            # Clean up stale voice client
             if vc and vc.is_connected():
                 try:
                     await vc.disconnect(force=True)
@@ -500,24 +508,27 @@ async def on_ready():
 @bot.event
 async def on_voice_state_update(member, before, after):
     """
-    Handles the bot being forcibly kicked.
-    Saves current chunk then goes IDLE.
-    The monitor loop handles rejoining naturally.
+    Only handles the bot being forcibly kicked.
+    Ignored if state is IDLE (normal join handshake events).
     """
     if member.id != bot.user.id:
         return
-    print(f"[DEBUG] before.channel={before.channel} after.channel={after.channel} state={get_state(member.guild.id).name}")
     if not (before.channel and not after.channel):
-        return  # Not a disconnect
+        return
 
     guild = before.channel.guild
     gid   = guild.id
+    state = get_state(gid)
 
-    print(f"⚠️  Bot kicked from '{before.channel.name}' in '{guild.name}'")
+    # Ignore disconnect events during IDLE — these are join handshake artifacts
+    if state == State.IDLE:
+        return
+
+    print(f"⚠️  Bot disconnected from '{before.channel.name}' in '{guild.name}'")
 
     session = active_sessions.pop(gid, None)
 
-    if session and get_state(gid) == State.RECORDING:
+    if session and state == State.RECORDING:
         await session.stop(reason="kicked")
     else:
         set_state(gid, State.IDLE)
@@ -642,7 +653,7 @@ def _save_whitelist():
 
 @bot.command()
 async def restart(ctx):
-    """Save recordings and restart the bot process. (Whitelisted only)"""
+    """Save recordings and restart the bot process."""
     if not _whitelisted(ctx):
         await ctx.send("⛔ You are not allowed to use this command.")
         return
@@ -651,7 +662,7 @@ async def restart(ctx):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # ==============================================================================
-# FLUSH HELPER  (used by !pause to preserve buffered audio before pausing)
+# FLUSH HELPER  (used by !pause to preserve buffered audio)
 # ==============================================================================
 
 async def _flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
@@ -659,9 +670,9 @@ async def _flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
     if not session:
         return
     vc = session.vc
-    if not vc or not vc.is_connected() or not vc.recording:
+    if not vc or not vc.is_connected() or not vc.is_recording():
         return
-    sink = vc.sink
+    sink = session.sink
     if not sink or user_id not in sink.audio_data:
         return
 
@@ -680,7 +691,6 @@ async def _flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
 
         merge_chunks(folder, today_str())
 
-        # Reset buffer and bump chunk number so next write doesn't collide
         sink.audio_data[user_id] = AudioData(io.BytesIO())
         session.chunk_num += 1
 
@@ -697,7 +707,7 @@ async def _shutdown_all():
         vc = session.vc
         if vc and vc.is_connected():
             print(f"   Saving '{session.guild.name}'...")
-            if vc.recording:
+            if vc.is_recording():
                 try:
                     vc.stop_recording()
                     await asyncio.sleep(3)
