@@ -261,7 +261,11 @@ class VoiceReceiver:
         self._connection.add_socket_listener(self._on_packet)
         # Hook into voice websocket to capture SPEAKING events for SSRC mapping
         self._hook_voice_ws()
-        print(f"   🎙️ VoiceReceiver started")
+        try:
+            mode = self._connection.mode
+            print(f"   🎙️ VoiceReceiver started (mode={mode})")
+        except Exception:
+            print(f"   🎙️ VoiceReceiver started (mode=unknown)")
 
     def stop(self):
         """Stop receiving voice packets."""
@@ -282,13 +286,18 @@ class VoiceReceiver:
         """
         try:
             ws = self._connection.ws
-        except Exception:
-            _log.debug('Cannot hook voice WS - not available yet')
+            if ws is None or (hasattr(ws, '__class__') and ws.__class__.__name__ == '_MissingSentinel'):
+                print("   ⚠️ Voice WS not available yet (MISSING)")
+                return
+        except Exception as e:
+            print(f"   ⚠️ Cannot hook voice WS: {e}")
             return
 
         if hasattr(ws, '__voice_receiver_hooked__'):
+            print("   ℹ️ Voice WS already hooked")
             return
 
+        print(f"   🔗 Hooking voice WS: {type(ws).__name__}")
         original = ws.received_message
         receiver = self
 
@@ -304,7 +313,7 @@ class VoiceReceiver:
                         user_id = int(user_id)
                         with receiver._lock:
                             receiver._ssrc_to_user[ssrc] = user_id
-                        _log.debug('SPEAKING: ssrc=%s -> user_id=%s', ssrc, user_id)
+                        print(f"   🔊 SPEAKING: ssrc={ssrc} -> user_id={user_id}")
                 elif op == 12:  # CLIENT_CONNECT
                     ssrc = data.get('audio_ssrc')
                     user_id = data.get('user_id')
@@ -312,6 +321,7 @@ class VoiceReceiver:
                         user_id = int(user_id)
                         with receiver._lock:
                             receiver._ssrc_to_user[ssrc] = user_id
+                        print(f"   🔗 CLIENT_CONNECT: ssrc={ssrc} -> user_id={user_id}")
                 elif op == 13:  # CLIENT_DISCONNECT
                     user_id = data.get('user_id')
                     if user_id is not None:
@@ -321,8 +331,9 @@ class VoiceReceiver:
                             for s in to_remove:
                                 del receiver._ssrc_to_user[s]
                                 receiver._decoders.pop(s, None)
-            except Exception:
-                _log.debug('Error in patched_received_message intercept', exc_info=True)
+                        print(f"   🔌 CLIENT_DISCONNECT: user_id={user_id}")
+            except Exception as e:
+                print(f"   ⚠️ Error in WS intercept: {e}")
 
             return await original(msg)
 
@@ -357,11 +368,6 @@ class VoiceReceiver:
             return None
 
         # Parse RTP header (12 bytes)
-        # Byte 0: V=2, P, X, CC
-        # Byte 1: M, PT (0x78 = 120 for Discord voice)
-        # Bytes 2-3: sequence number (big-endian)
-        # Bytes 4-7: timestamp (big-endian)
-        # Bytes 8-11: SSRC (big-endian)
         header = data[:12]
         ssrc = struct.unpack_from('>I', header, 8)[0]
 
@@ -372,16 +378,14 @@ class VoiceReceiver:
         except Exception:
             pass
 
-        # Handle RTP header extensions and CSRC
-        cc = header[0] & 0x0F  # CSRC count
-        has_extension = bool(header[0] & 0x10)
-        header_size = 12 + cc * 4
+        # For aead_xchacha20_poly1305_rtpsize, the entire payload after the
+        # 12-byte RTP header is encrypted (including any extensions).
+        # For other modes, extensions are in the clear and must be skipped.
+        # However, Discord doesn't currently send RTP extensions on voice
+        # data packets — only on the RTCP/IP discovery packets which have
+        # different payload types. So we always use data[12:] for decryption.
 
-        if has_extension and len(data) > header_size + 4:
-            ext_length = struct.unpack_from('>H', data, header_size + 2)[0]
-            header_size += 4 + ext_length * 4
-
-        encrypted_data = data[header_size:]
+        encrypted_data = data[12:]
         if not encrypted_data:
             return None
 
@@ -391,16 +395,24 @@ class VoiceReceiver:
             secret_key = bytes(self._connection.secret_key)
 
             if mode == 'aead_xchacha20_poly1305_rtpsize':
-                opus_data = self._decrypt_aead_xchacha20(data[:12], data[12:], secret_key)
+                opus_data = self._decrypt_aead_xchacha20(header, encrypted_data, secret_key)
             elif mode == 'xsalsa20_poly1305_lite':
                 opus_data = self._decrypt_xsalsa20_lite(encrypted_data, secret_key)
             elif mode == 'xsalsa20_poly1305_suffix':
                 opus_data = self._decrypt_xsalsa20_suffix(encrypted_data, secret_key)
             elif mode == 'xsalsa20_poly1305':
-                opus_data = self._decrypt_xsalsa20(data[:12], encrypted_data, secret_key)
+                opus_data = self._decrypt_xsalsa20(header, encrypted_data, secret_key)
             else:
+                if not hasattr(self, '_dbg_mode_warned'):
+                    print(f"   ⚠️ Unknown encryption mode: {mode}")
+                    self._dbg_mode_warned = True
                 return None
-        except Exception:
+        except Exception as e:
+            if not hasattr(self, '_dbg_decrypt_err_count'):
+                self._dbg_decrypt_err_count = 0
+            self._dbg_decrypt_err_count += 1
+            if self._dbg_decrypt_err_count <= 5:
+                print(f"   ⚠️ Decrypt error ({type(e).__name__}): {e} [mode={getattr(self._connection, 'mode', '?')}, data_len={len(data)}]")
             return None
 
         if not opus_data:
@@ -411,7 +423,12 @@ class VoiceReceiver:
             dave_session = self._connection.dave_session
             if dave_session and self._connection.dave_protocol_version > 0:
                 opus_data = dave_session.decrypt_opus(opus_data, ssrc)
-        except Exception:
+        except Exception as e:
+            if not hasattr(self, '_dbg_dave_err_count'):
+                self._dbg_dave_err_count = 0
+            self._dbg_dave_err_count += 1
+            if self._dbg_dave_err_count <= 5:
+                print(f"   ⚠️ DAVE decrypt error ({type(e).__name__}): {e}")
             return None
 
         return (ssrc, opus_data)
@@ -455,8 +472,23 @@ class VoiceReceiver:
         if not self._recording:
             return
 
+        # Debug counters (throttled)
+        if not hasattr(self, '_dbg_total'):
+            self._dbg_total = 0
+            self._dbg_decrypt_fail = 0
+            self._dbg_no_ssrc = 0
+            self._dbg_not_whitelisted = 0
+            self._dbg_paused = 0
+            self._dbg_silence = 0
+            self._dbg_decode_fail = 0
+            self._dbg_ok = 0
+            self._dbg_last_log = 0
+        self._dbg_total += 1
+
         result = self._decrypt_packet(data)
         if result is None:
+            self._dbg_decrypt_fail += 1
+            self._dbg_maybe_log()
             return
 
         ssrc, opus_data = result
@@ -466,29 +498,62 @@ class VoiceReceiver:
             user_id = self._ssrc_to_user.get(ssrc)
 
         if user_id is None:
+            self._dbg_no_ssrc += 1
+            self._dbg_maybe_log()
             return
 
         # Filter: only whitelisted, non-paused users
         if user_id not in ALLOWED_USERS:
+            self._dbg_not_whitelisted += 1
+            self._dbg_maybe_log()
             return
         if is_user_paused(user_id):
+            self._dbg_paused += 1
+            self._dbg_maybe_log()
             return
 
         # Skip silence frames
         if opus_data == self.SILENCE_FRAME:
+            self._dbg_silence += 1
+            self._dbg_maybe_log()
             return
 
         # Decode Opus to PCM
         try:
             decoder = self._get_decoder(ssrc)
             pcm = decoder.decode(opus_data, fec=False)
-        except Exception:
+        except Exception as e:
+            self._dbg_decode_fail += 1
+            if self._dbg_decode_fail <= 3:
+                print(f"   ⚠️ Opus decode error: {e}")
+            self._dbg_maybe_log()
             return
+
+        self._dbg_ok += 1
 
         # Store in per-user buffer
         if user_id not in self.audio_data:
             self.audio_data[user_id] = AudioBuffer()
+            print(f"   📝 First audio packet for user {user_id}")
         self.audio_data[user_id].write(pcm)
+        self._dbg_maybe_log()
+
+    def _dbg_maybe_log(self):
+        """Print debug stats every 30 seconds."""
+        now = time.time()
+        if now - self._dbg_last_log < 30:
+            return
+        self._dbg_last_log = now
+        with self._lock:
+            ssrc_map_size = len(self._ssrc_to_user)
+            ssrc_map = dict(self._ssrc_to_user)
+        print(
+            f"   📊 Packets: total={self._dbg_total} ok={self._dbg_ok} "
+            f"decrypt_fail={self._dbg_decrypt_fail} no_ssrc={self._dbg_no_ssrc} "
+            f"!whitelist={self._dbg_not_whitelisted} paused={self._dbg_paused} "
+            f"silence={self._dbg_silence} decode_fail={self._dbg_decode_fail} "
+            f"ssrc_map({ssrc_map_size})={ssrc_map}"
+        )
 
 
 # ==============================================================================
@@ -731,13 +796,15 @@ async def monitor():
 
             print(f"🎯 Joining '{target.name}' in '{guild.name}'...")
             try:
-                new_vc  = await target.connect()
+                new_vc  = await target.connect(timeout=60.0, self_deaf=True)
                 session = RecordingSession(new_vc)
                 session.start()
                 active_sessions[gid] = session
                 set_state(gid, State.RECORDING)
             except Exception as e:
+                import traceback
                 print(f"❌ Failed to join '{target.name}': {e}")
+                traceback.print_exc()
                 guild_cooldown[gid] = now + LEAVE_COOLDOWN
 
 # ==============================================================================
