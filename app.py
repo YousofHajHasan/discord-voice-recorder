@@ -363,13 +363,20 @@ class VoiceReceiver:
         """
         Parse RTP header, decrypt the voice payload.
         Returns (ssrc, opus_data) or None on failure.
+
+        For 'rtpsize' modes the unencrypted header (= AAD for AEAD) is
+        determined the same way as SRTP (RFC 3711 §3.1):
+          - 12-byte fixed header
+          - 4 × CC bytes of CSRC list  (CC = lower 4 bits of byte 0)
+          - if extension bit (X, bit 4 of byte 0) is set: 4-byte
+            extension preamble (profile-specific ID + length)
+        Everything after that unencrypted header is ciphertext + nonce.
         """
         if len(data) < 12:
             return None
 
-        # Parse RTP header (12 bytes)
-        header = data[:12]
-        ssrc = struct.unpack_from('>I', header, 8)[0]
+        # --- Parse fixed 12-byte RTP header ---
+        ssrc = struct.unpack_from('>I', data, 8)[0]
 
         # Skip our own SSRC
         try:
@@ -378,16 +385,24 @@ class VoiceReceiver:
         except Exception:
             pass
 
-        # For aead_xchacha20_poly1305_rtpsize, the entire payload after the
-        # 12-byte RTP header is encrypted (including any extensions).
-        # For other modes, extensions are in the clear and must be skipped.
-        # However, Discord doesn't currently send RTP extensions on voice
-        # data packets — only on the RTCP/IP discovery packets which have
-        # different payload types. So we always use data[12:] for decryption.
+        # --- Compute unencrypted header size (rtpsize rule) ---
+        byte0 = data[0]
+        cc = byte0 & 0x0F             # CSRC count
+        has_extension = byte0 & 0x10  # extension bit (X)
+        header_len = 12 + 4 * cc
+        if has_extension:
+            header_len += 4           # 4-byte extension preamble
 
-        encrypted_data = data[12:]
-        if not encrypted_data:
+        if len(data) <= header_len:
             return None
+
+        header = bytes(data[:header_len])
+        encrypted_data = data[header_len:]
+
+        # Debug: log first packet header details
+        if not hasattr(self, '_dbg_hdr_logged'):
+            self._dbg_hdr_logged = True
+            print(f"   🔎 First pkt: byte0=0x{byte0:02x} CC={cc} ext={bool(has_extension)} hdr_len={header_len} pkt_len={len(data)}")
 
         # Decrypt based on encryption mode
         try:
@@ -412,7 +427,7 @@ class VoiceReceiver:
                 self._dbg_decrypt_err_count = 0
             self._dbg_decrypt_err_count += 1
             if self._dbg_decrypt_err_count <= 5:
-                print(f"   ⚠️ Decrypt error ({type(e).__name__}): {e} [mode={getattr(self._connection, 'mode', '?')}, data_len={len(data)}]")
+                print(f"   ⚠️ Decrypt error ({type(e).__name__}): {e} [mode={getattr(self._connection, 'mode', '?')}, hdr_len={header_len}, data_len={len(data)}]")
             return None
 
         if not opus_data:
@@ -434,13 +449,17 @@ class VoiceReceiver:
         return (ssrc, opus_data)
 
     def _decrypt_aead_xchacha20(self, header: bytes, after_header: bytes, secret_key: bytes) -> bytes:
-        """Decrypt aead_xchacha20_poly1305_rtpsize mode."""
+        """Decrypt aead_xchacha20_poly1305_rtpsize mode.
+        
+        AAD = full unencrypted RTP header (12 + CSRC + ext preamble).
+        Ciphertext = everything between header and the 4-byte nonce suffix.
+        """
         nonce_bytes = after_header[-4:]
         encrypted = after_header[:-4]
         nonce = bytearray(24)
         nonce[:4] = nonce_bytes
         box = nacl.secret.Aead(secret_key)
-        return box.decrypt(bytes(encrypted), bytes(header[:12]), bytes(nonce))
+        return box.decrypt(bytes(encrypted), bytes(header), bytes(nonce))
 
     def _decrypt_xsalsa20(self, header: bytes, encrypted_data: bytes, secret_key: bytes) -> bytes:
         """Decrypt xsalsa20_poly1305 mode."""
