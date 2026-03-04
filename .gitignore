@@ -8,3 +8,4 @@ venv/
 test.py
 test.ipynb
 silero_vad.onnx
+*.bak

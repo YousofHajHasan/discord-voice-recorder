@@ -1,14 +1,6 @@
-"""
-Discord Voice Recording Bot
-Compatible with: py-cord DA-344/feat/voice-rewrite-and-fixes (DAVE support branch)
-Install:
-    pip install "py-cord[voice] @ git+https://github.com/DA-344/pycord.git@feat/voice-rewrite-and-fixes"
-    pip install davey
-"""
-
 import discord
 from discord.ext import commands, tasks
-from discord.sinks import Sink, AudioData, Filters
+from discord import opus as discord_opus
 import os
 import sys
 import time
@@ -16,8 +8,16 @@ import asyncio
 import subprocess
 import glob
 import io
+import struct
+import threading
+import logging
 from datetime import datetime
 from enum import Enum, auto
+
+import nacl.secret
+import nacl.utils
+
+_log = logging.getLogger(__name__)
 
 # ==============================================================================
 # CONFIGURATION
@@ -61,7 +61,7 @@ print(f"   User whitelist : {ALLOWED_USERS or 'EMPTY — no one will be recorded
 class State(Enum):
     IDLE      = auto()   # Not in any VC. Monitor loop scans for a target.
     RECORDING = auto()   # In a VC and actively recording.
-    SAVING    = auto()   # stop_recording() fired; waiting for callback to finish.
+    SAVING    = auto()   # Saving in progress; waiting to finish.
 
 guild_state:       dict = {}
 guild_cooldown:    dict = {}
@@ -154,7 +154,7 @@ def merge_chunks(folder: str, date_str: str):
 
 def startup_cleanup():
     """On startup: merge any unmerged chunks from previous sessions."""
-    print(f"🔍 Startup cleanup on '{BASE_DIR}'...")
+    print(f"�� Startup cleanup on '{BASE_DIR}'...")
     os.makedirs(BASE_DIR, exist_ok=True)
 
     folders = [
@@ -177,51 +177,319 @@ def startup_cleanup():
 
     print("✅ Startup cleanup done.")
 
+
 # ==============================================================================
-# CUSTOM SINK  (whitelist + pause filter)
+# VOICE RECEIVE INFRASTRUCTURE  (replaces pycord's Sink system)
 # ==============================================================================
 
-class WhitelistMP3Sink(Sink):
+class AudioBuffer:
+    """Holds raw PCM audio data for one user, thread-safe."""
+
+    def __init__(self):
+        self._buf = io.BytesIO()
+        self._lock = threading.Lock()
+
+    def write(self, pcm_data: bytes):
+        with self._lock:
+            self._buf.write(pcm_data)
+
+    def read_all(self) -> bytes:
+        with self._lock:
+            self._buf.seek(0)
+            data = self._buf.read()
+            return data
+
+    def reset(self):
+        with self._lock:
+            self._buf = io.BytesIO()
+
+    @property
+    def empty(self) -> bool:
+        with self._lock:
+            pos = self._buf.tell()
+            return pos == 0
+
+
+def pcm_to_mp3(pcm_data: bytes) -> bytes:
+    """Convert raw 16-bit 48kHz stereo PCM to MP3 via ffmpeg."""
+    if not pcm_data:
+        return b''
+    process = subprocess.Popen(
+        ['ffmpeg', '-y',
+         '-f', 's16le', '-ar', '48000', '-ac', '2',
+         '-i', 'pipe:0',
+         '-f', 'mp3', 'pipe:1'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+    mp3_data, _ = process.communicate(input=pcm_data)
+    return mp3_data
+
+
+class VoiceReceiver:
     """
-    Records only whitelisted, non-paused users.
-    Extends the base Sink class from the new voice rewrite branch.
-    Audio data arrives already decrypted (including DAVE) by the time
-    write() is called — no changes needed here for DAVE support.
+    Receives voice data from a discord.py VoiceClient using SocketReader callbacks.
+
+    The SocketReader delivers raw encrypted UDP packets. We:
+      1. Parse the 12-byte RTP header to extract SSRC
+      2. Strip the RTP header and encryption nonce/tag
+      3. Decrypt the payload using the connection's secret key + mode
+      4. DAVE-decrypt if DAVE session is active
+      5. Decode Opus -> PCM
+      6. Write PCM into per-user AudioBuffer (filtered by whitelist + pause)
+
+    SSRC->user_id mapping comes from the voice websocket's SPEAKING event (opcode 5).
+    We hook into this by monkey-patching the voice websocket's received_message handler.
     """
 
-    @Filters.container
-    def write(self, data, user):
-        if user not in ALLOWED_USERS:
-            return
-        if is_user_paused(user):
-            return
-        if user not in self.audio_data:
-            self.audio_data[user] = AudioData(io.BytesIO())
-        self.audio_data[user].write(data)
+    SILENCE_FRAME = b'\xf8\xff\xfe'  # Opus silence
 
-    def format_audio(self, audio: AudioData):
+    def __init__(self, vc: discord.VoiceClient):
+        self.vc = vc
+        self._connection = vc._connection  # VoiceConnectionState
+        self.audio_data: dict[int, AudioBuffer] = {}  # user_id -> AudioBuffer
+        self._ssrc_to_user: dict[int, int] = {}       # ssrc -> user_id
+        self._decoders: dict = {}                      # ssrc -> OpusDecoder
+        self._lock = threading.Lock()
+        self._recording = False
+
+    def start(self):
+        """Start receiving voice packets."""
+        self._recording = True
+        # Register our callback with the SocketReader
+        self._connection.add_socket_listener(self._on_packet)
+        # Hook into voice websocket to capture SPEAKING events for SSRC mapping
+        self._hook_voice_ws()
+        print(f"   🎙️ VoiceReceiver started")
+
+    def stop(self):
+        """Stop receiving voice packets."""
+        self._recording = False
+        self._connection.remove_socket_listener(self._on_packet)
+        self._unhook_voice_ws()
+        print(f"   🎙️ VoiceReceiver stopped")
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    def _hook_voice_ws(self):
         """
-        Called by the base Sink during cleanup() for each AudioData.
-        Converts raw PCM stored in the BytesIO to MP3 via ffmpeg.
+        Monkey-patch the voice websocket's received_message to intercept
+        SPEAKING (op 5), CLIENT_CONNECT (op 12), and CLIENT_DISCONNECT (op 13)
+        events, which provide the SSRC -> user_id mapping.
         """
-        audio.file.seek(0)
-        raw = audio.file.read()
-        if not raw:
+        try:
+            ws = self._connection.ws
+        except Exception:
+            _log.debug('Cannot hook voice WS - not available yet')
             return
 
-        process = subprocess.Popen(
-            ['ffmpeg', '-y',
-             '-f', 's16le', '-ar', '48000', '-ac', '2',
-             '-i', 'pipe:0',
-             '-f', 'mp3', 'pipe:1'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
-        mp3_data, _ = process.communicate(input=raw)
+        if hasattr(ws, '__voice_receiver_hooked__'):
+            return
 
-        audio.file = io.BytesIO(mp3_data)
-        audio.file.seek(0)
+        original = ws.received_message
+        receiver = self
+
+        async def patched_received_message(msg: dict):
+            # Intercept before passing to original handler
+            try:
+                op = msg.get('op')
+                data = msg.get('d', {})
+                if op == 5:  # SPEAKING
+                    ssrc = data.get('ssrc')
+                    user_id = data.get('user_id')
+                    if ssrc is not None and user_id is not None:
+                        user_id = int(user_id)
+                        with receiver._lock:
+                            receiver._ssrc_to_user[ssrc] = user_id
+                        _log.debug('SPEAKING: ssrc=%s -> user_id=%s', ssrc, user_id)
+                elif op == 12:  # CLIENT_CONNECT
+                    ssrc = data.get('audio_ssrc')
+                    user_id = data.get('user_id')
+                    if ssrc is not None and user_id is not None:
+                        user_id = int(user_id)
+                        with receiver._lock:
+                            receiver._ssrc_to_user[ssrc] = user_id
+                elif op == 13:  # CLIENT_DISCONNECT
+                    user_id = data.get('user_id')
+                    if user_id is not None:
+                        user_id = int(user_id)
+                        with receiver._lock:
+                            to_remove = [s for s, u in receiver._ssrc_to_user.items() if u == user_id]
+                            for s in to_remove:
+                                del receiver._ssrc_to_user[s]
+                                receiver._decoders.pop(s, None)
+            except Exception:
+                _log.debug('Error in patched_received_message intercept', exc_info=True)
+
+            return await original(msg)
+
+        ws.__voice_receiver_hooked__ = True
+        ws.__original_received_message__ = original
+        ws.received_message = patched_received_message
+
+    def _unhook_voice_ws(self):
+        """Restore the original received_message handler."""
+        try:
+            ws = self._connection.ws
+            if hasattr(ws, '__original_received_message__'):
+                ws.received_message = ws.__original_received_message__
+                del ws.__original_received_message__
+            if hasattr(ws, '__voice_receiver_hooked__'):
+                del ws.__voice_receiver_hooked__
+        except Exception:
+            pass
+
+    def _get_decoder(self, ssrc: int):
+        """Get or create an Opus decoder for an SSRC."""
+        if ssrc not in self._decoders:
+            self._decoders[ssrc] = discord_opus.Decoder()
+        return self._decoders[ssrc]
+
+    def _decrypt_packet(self, data: bytes):
+        """
+        Parse RTP header, decrypt the voice payload.
+        Returns (ssrc, opus_data) or None on failure.
+        """
+        if len(data) < 12:
+            return None
+
+        # Parse RTP header (12 bytes)
+        # Byte 0: V=2, P, X, CC
+        # Byte 1: M, PT (0x78 = 120 for Discord voice)
+        # Bytes 2-3: sequence number (big-endian)
+        # Bytes 4-7: timestamp (big-endian)
+        # Bytes 8-11: SSRC (big-endian)
+        header = data[:12]
+        ssrc = struct.unpack_from('>I', header, 8)[0]
+
+        # Skip our own SSRC
+        try:
+            if ssrc == self._connection.ssrc:
+                return None
+        except Exception:
+            pass
+
+        # Handle RTP header extensions and CSRC
+        cc = header[0] & 0x0F  # CSRC count
+        has_extension = bool(header[0] & 0x10)
+        header_size = 12 + cc * 4
+
+        if has_extension and len(data) > header_size + 4:
+            ext_length = struct.unpack_from('>H', data, header_size + 2)[0]
+            header_size += 4 + ext_length * 4
+
+        encrypted_data = data[header_size:]
+        if not encrypted_data:
+            return None
+
+        # Decrypt based on encryption mode
+        try:
+            mode = self._connection.mode
+            secret_key = bytes(self._connection.secret_key)
+
+            if mode == 'aead_xchacha20_poly1305_rtpsize':
+                opus_data = self._decrypt_aead_xchacha20(data[:12], data[12:], secret_key)
+            elif mode == 'xsalsa20_poly1305_lite':
+                opus_data = self._decrypt_xsalsa20_lite(encrypted_data, secret_key)
+            elif mode == 'xsalsa20_poly1305_suffix':
+                opus_data = self._decrypt_xsalsa20_suffix(encrypted_data, secret_key)
+            elif mode == 'xsalsa20_poly1305':
+                opus_data = self._decrypt_xsalsa20(data[:12], encrypted_data, secret_key)
+            else:
+                return None
+        except Exception:
+            return None
+
+        if not opus_data:
+            return None
+
+        # DAVE decryption if session is active
+        try:
+            dave_session = self._connection.dave_session
+            if dave_session and self._connection.dave_protocol_version > 0:
+                opus_data = dave_session.decrypt_opus(opus_data, ssrc)
+        except Exception:
+            return None
+
+        return (ssrc, opus_data)
+
+    def _decrypt_aead_xchacha20(self, header: bytes, after_header: bytes, secret_key: bytes) -> bytes:
+        """Decrypt aead_xchacha20_poly1305_rtpsize mode."""
+        nonce_bytes = after_header[-4:]
+        encrypted = after_header[:-4]
+        nonce = bytearray(24)
+        nonce[:4] = nonce_bytes
+        box = nacl.secret.Aead(secret_key)
+        return box.decrypt(bytes(encrypted), bytes(header[:12]), bytes(nonce))
+
+    def _decrypt_xsalsa20(self, header: bytes, encrypted_data: bytes, secret_key: bytes) -> bytes:
+        """Decrypt xsalsa20_poly1305 mode."""
+        box = nacl.secret.SecretBox(secret_key)
+        nonce = bytearray(24)
+        nonce[:12] = header[:12]
+        return box.decrypt(bytes(encrypted_data), bytes(nonce))
+
+    def _decrypt_xsalsa20_suffix(self, encrypted_data: bytes, secret_key: bytes) -> bytes:
+        """Decrypt xsalsa20_poly1305_suffix mode."""
+        box = nacl.secret.SecretBox(secret_key)
+        nonce = encrypted_data[-24:]
+        encrypted = encrypted_data[:-24]
+        return box.decrypt(bytes(encrypted), bytes(nonce))
+
+    def _decrypt_xsalsa20_lite(self, encrypted_data: bytes, secret_key: bytes) -> bytes:
+        """Decrypt xsalsa20_poly1305_lite mode."""
+        box = nacl.secret.SecretBox(secret_key)
+        nonce = bytearray(24)
+        nonce[:4] = encrypted_data[-4:]
+        encrypted = encrypted_data[:-4]
+        return box.decrypt(bytes(encrypted), bytes(nonce))
+
+    def _on_packet(self, data: bytes):
+        """
+        SocketReader callback - runs in the reader thread.
+        Receives raw encrypted UDP packets from the voice socket.
+        """
+        if not self._recording:
+            return
+
+        result = self._decrypt_packet(data)
+        if result is None:
+            return
+
+        ssrc, opus_data = result
+
+        # Map SSRC to user_id
+        with self._lock:
+            user_id = self._ssrc_to_user.get(ssrc)
+
+        if user_id is None:
+            return
+
+        # Filter: only whitelisted, non-paused users
+        if user_id not in ALLOWED_USERS:
+            return
+        if is_user_paused(user_id):
+            return
+
+        # Skip silence frames
+        if opus_data == self.SILENCE_FRAME:
+            return
+
+        # Decode Opus to PCM
+        try:
+            decoder = self._get_decoder(ssrc)
+            pcm = decoder.decode(opus_data, fec=False)
+        except Exception:
+            return
+
+        # Store in per-user buffer
+        if user_id not in self.audio_data:
+            self.audio_data[user_id] = AudioBuffer()
+        self.audio_data[user_id].write(pcm)
+
 
 # ==============================================================================
 # RECORDING SESSION
@@ -233,43 +501,47 @@ class RecordingSession:
     Created when the bot joins, destroyed when it leaves.
     The monitor loop is the ONLY place that creates a RecordingSession.
 
-    New API changes (DA-344 branch):
-    - start_recording(sink, callback) — callback is now `def cb(error)`, sink NOT passed
-    - stop_recording() — raises RecordingException if not recording
-    - vc.is_recording() — replaces vc.recording property
-    - Sink is stored on self.sink so we can access it in the callback
+    Uses VoiceReceiver (SocketReader-based) instead of pycord's Sink system.
     """
 
     def __init__(self, vc: discord.VoiceClient):
         self.vc          = vc
         self.guild       = vc.guild
-        self.sink        = WhitelistMP3Sink()   # stored here — callback no longer receives it
+        self.receiver    = VoiceReceiver(vc)
         self.chunk_num   = 1
         self.chunk_start = time.time()
         self.date_str    = today_str()
 
     # ------------------------------------------------------------------
-    # Save all audio from a finished sink to disk, then merge per user.
+    # Save all audio from a finished receiver to disk, then merge per user.
     # ------------------------------------------------------------------
-    def _save_sink(self, sink: WhitelistMP3Sink):
+    def _save_receiver(self, audio_data: dict, chunk_num: int):
         saved_folders = set()
 
-        for user_id, audio in sink.audio_data.items():
+        for user_id, buffer in audio_data.items():
             member    = self.guild.get_member(user_id)
             user_name = member.name if member else str(user_id)
             folder    = user_folder(user_id, user_name)
 
             try:
-                audio.file.seek(0)
-                data = audio.file.read()
-                if not data:
+                pcm_data = buffer.read_all()
+                if not pcm_data:
                     print(f"   ⚠️  Empty audio for {user_name}, skipping.")
                     continue
 
-                chunk_file = os.path.join(folder, f"{user_name}_part{self.chunk_num}.mp3")
+                # Convert PCM to MP3
+                mp3_data = pcm_to_mp3(pcm_data)
+                if not mp3_data:
+                    print(f"   ⚠️  MP3 conversion failed for {user_name}, saving raw PCM.")
+                    chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}.pcm")
+                    with open(chunk_file, 'wb') as f:
+                        f.write(pcm_data)
+                    continue
+
+                chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}.mp3")
                 with open(chunk_file, 'wb') as f:
-                    f.write(data)
-                print(f"   ✅ Saved chunk {self.chunk_num} for {user_name}")
+                    f.write(mp3_data)
+                print(f"   ✅ Saved chunk {chunk_num} for {user_name}")
                 saved_folders.add(folder)
 
             except Exception as e:
@@ -282,80 +554,46 @@ class RecordingSession:
     # Begin recording on the voice client.
     # ------------------------------------------------------------------
     def start(self):
-        self.sink        = WhitelistMP3Sink()
+        self.receiver    = VoiceReceiver(self.vc)
         self.chunk_start = time.time()
         self.date_str    = today_str()
-
-        # Callback now only receives `error` — sink accessed via self.sink
-        def _callback(error: Exception | None):
-            if error:
-                print(f"   ❌ Recording error: {error}")
-            asyncio.run_coroutine_threadsafe(
-                self._on_stop(), bot.loop
-            )
-
-        self.vc.start_recording(self.sink, _callback)
+        self.receiver.start()
         print(f"▶️  Recording started — '{self.vc.channel.name}' chunk {self.chunk_num}")
-
-    # ------------------------------------------------------------------
-    # Called after stop_recording() finishes — saves chunk, sets IDLE.
-    # ------------------------------------------------------------------
-    async def _on_stop(self):
-        print(f"💾 Processing chunk {self.chunk_num} for '{self.guild.name}'...")
-        self._save_sink(self.sink)
-        print(f"✅ Chunk {self.chunk_num} done.")
-        set_state(self.guild.id, State.IDLE)
 
     # ------------------------------------------------------------------
     # Rotate: stop current chunk, save, start next chunk immediately.
     # ------------------------------------------------------------------
     async def rotate(self):
-        if not self.vc.is_recording():
+        if not self.receiver.is_recording:
             return
 
         current_chunk    = self.chunk_num
-        current_sink     = self.sink
+        current_audio    = self.receiver.audio_data
+        current_date     = self.date_str
         print(f"🔄 Rotating chunk {current_chunk} in '{self.guild.name}'...")
-        set_state(self.guild.id, State.SAVING)
 
-        def _rotate_callback(error: Exception | None):
-            if error:
-                print(f"   ❌ Rotate recording error: {error}")
-            asyncio.run_coroutine_threadsafe(
-                self._on_rotate_done(current_sink, current_chunk), bot.loop
-            )
+        # Stop the current receiver
+        self.receiver.stop()
 
-        # Prepare next sink before stopping so it's ready immediately
+        # Start a new chunk immediately
         self.chunk_num  += 1
         self.chunk_start = time.time()
         self.date_str    = today_str()
-        self.sink        = WhitelistMP3Sink()
 
-        try:
-            self.vc.stop_recording()
-        except Exception as e:
-            print(f"❌ rotate() stop_recording failed: {e}")
-            # Rollback
-            self.chunk_num  -= 1
-            self.chunk_start = time.time()
-            self.sink        = current_sink
-            set_state(self.guild.id, State.RECORDING)
+        if self.vc.is_connected():
+            self.receiver = VoiceReceiver(self.vc)
+            self.receiver.start()
+            print(f"▶️  Chunk {self.chunk_num} started in '{self.vc.channel.name}'")
+        else:
+            set_state(self.guild.id, State.IDLE)
             return
 
-        # Immediately start next chunk
-        if self.vc.is_connected():
-            self.vc.start_recording(self.sink, _rotate_callback)
-            set_state(self.guild.id, State.RECORDING)
-            print(f"▶️  Chunk {self.chunk_num} started in '{self.vc.channel.name}'")
-
-    async def _on_rotate_done(self, old_sink: WhitelistMP3Sink, chunk_num: int):
-        print(f"💾 Saving chunk {chunk_num} for '{self.guild.name}'...")
-        # Temporarily set chunk_num back to save with correct number
-        real_chunk_num  = self.chunk_num
-        self.chunk_num  = chunk_num
-        self._save_sink(old_sink)
-        self.chunk_num  = real_chunk_num
-        print(f"✅ Chunk {chunk_num} saved.")
+        # Save old chunk in background (CPU-bound ffmpeg work)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, self._save_receiver, current_audio, current_chunk
+        )
+        print(f"✅ Chunk {current_chunk} saved.")
 
     # ------------------------------------------------------------------
     # Stop: save chunk, disconnect, go IDLE.
@@ -364,15 +602,21 @@ class RecordingSession:
         print(f"⏹️  Stopping session ({reason}) in '{self.guild.name}'...")
         set_state(self.guild.id, State.SAVING)
 
-        if self.vc.is_recording():
-            try:
-                self.vc.stop_recording()
-                # _on_stop() callback will fire and set state to IDLE
-            except Exception as e:
-                print(f"❌ stop_recording() error: {e}")
-                set_state(self.guild.id, State.IDLE)
-        else:
-            set_state(self.guild.id, State.IDLE)
+        if self.receiver.is_recording:
+            self.receiver.stop()
+
+        # Save remaining audio
+        audio_data = self.receiver.audio_data
+        chunk_num  = self.chunk_num
+        if audio_data:
+            print(f"💾 Processing chunk {chunk_num} for '{self.guild.name}'...")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self._save_receiver, audio_data, chunk_num
+            )
+            print(f"✅ Chunk {chunk_num} done.")
+
+        set_state(self.guild.id, State.IDLE)
 
         await asyncio.sleep(1)
 
@@ -434,7 +678,7 @@ async def monitor():
         if gid in guild_cooldown and now >= guild_cooldown[gid]:
             del guild_cooldown[gid]
 
-        # Saving: wait for callback to finish
+        # Saving: wait for save to finish
         if state == State.SAVING:
             continue
 
@@ -447,6 +691,8 @@ async def monitor():
             # Silent disconnect
             if not vc or not vc.is_connected():
                 print(f"⚠️  Silent disconnect in '{guild.name}' — going IDLE.")
+                if session and session.receiver.is_recording:
+                    session.receiver.stop()
                 active_sessions.pop(gid, None)
                 set_state(gid, State.IDLE)
                 guild_cooldown[gid] = now + LEAVE_COOLDOWN
@@ -670,28 +916,36 @@ async def _flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
     if not session:
         return
     vc = session.vc
-    if not vc or not vc.is_connected() or not vc.is_recording():
+    if not vc or not vc.is_connected() or not session.receiver.is_recording:
         return
-    sink = session.sink
-    if not sink or user_id not in sink.audio_data:
+    receiver = session.receiver
+    if user_id not in receiver.audio_data:
         return
 
-    audio = sink.audio_data[user_id]
+    buffer = receiver.audio_data[user_id]
     try:
-        audio.file.seek(0)
-        data = audio.file.read()
-        if not data:
+        pcm_data = buffer.read_all()
+        if not pcm_data:
             return
 
-        folder     = user_folder(user_id, user_name)
-        chunk_file = os.path.join(folder, f"{user_name}_part{session.chunk_num}_pre_pause.mp3")
-        with open(chunk_file, 'wb') as f:
-            f.write(data)
+        folder   = user_folder(user_id, user_name)
+        mp3_data = pcm_to_mp3(pcm_data)
+
+        if mp3_data:
+            chunk_file = os.path.join(folder, f"{user_name}_part{session.chunk_num}_pre_pause.mp3")
+            with open(chunk_file, 'wb') as f:
+                f.write(mp3_data)
+        else:
+            chunk_file = os.path.join(folder, f"{user_name}_part{session.chunk_num}_pre_pause.pcm")
+            with open(chunk_file, 'wb') as f:
+                f.write(pcm_data)
+
         print(f"   💾 Pre-pause flush saved for {user_name}")
 
         merge_chunks(folder, today_str())
 
-        sink.audio_data[user_id] = AudioData(io.BytesIO())
+        # Reset the user's buffer
+        buffer.reset()
         session.chunk_num += 1
 
     except Exception as e:
@@ -707,12 +961,12 @@ async def _shutdown_all():
         vc = session.vc
         if vc and vc.is_connected():
             print(f"   Saving '{session.guild.name}'...")
-            if vc.is_recording():
-                try:
-                    vc.stop_recording()
-                    await asyncio.sleep(3)
-                except Exception as e:
-                    print(f"   ⚠️  stop_recording error: {e}")
+            if session.receiver.is_recording:
+                session.receiver.stop()
+                audio_data = session.receiver.audio_data
+                if audio_data:
+                    session._save_receiver(audio_data, session.chunk_num)
+                await asyncio.sleep(1)
             try:
                 await vc.disconnect(force=True)
             except Exception:
