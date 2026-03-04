@@ -375,6 +375,12 @@ class VoiceReceiver:
         if len(data) < 12:
             return None
 
+        # Filter out RTCP control packets (payload type 200-204).
+        # RTP audio has PT=120 (0x78); RTCP uses PT in range 200-204.
+        pt = data[1] & 0x7F
+        if pt >= 200:
+            return None
+
         # --- Parse fixed 12-byte RTP header ---
         ssrc = struct.unpack_from('>I', data, 8)[0]
 
@@ -433,18 +439,38 @@ class VoiceReceiver:
         if not opus_data:
             return None
 
-        # DAVE decryption if session is active
+        # DAVE decryption if session is active and ready (E2EE layer on top of transport)
         try:
             dave_session = self._connection.dave_session
-            if dave_session and self._connection.dave_protocol_version > 0:
-                opus_data = dave_session.decrypt_opus(opus_data, ssrc)
+            if dave_session and self._connection.dave_protocol_version > 0 and getattr(dave_session, 'ready', False):
+                # Introspect available methods once so we can identify the correct name from logs
+                if not getattr(self, '_dbg_dave_methods_printed', False):
+                    self._dbg_dave_methods_printed = True
+                    methods = [m for m in dir(dave_session) if not m.startswith('_')]
+                    print(f"   🔬 DaveSession methods: {methods}")
+                # Try known decrypt method names in order of likelihood
+                if hasattr(dave_session, 'decrypt_media'):
+                    opus_data = dave_session.decrypt_media(opus_data, ssrc)
+                elif hasattr(dave_session, 'decrypt_opus'):
+                    opus_data = dave_session.decrypt_opus(opus_data, ssrc)
+                elif hasattr(dave_session, 'decrypt'):
+                    opus_data = dave_session.decrypt(opus_data, ssrc)
+                # else: passthrough — data is already plain opus (passthrough mode)
         except Exception as e:
+            if not getattr(self, '_dbg_dave_methods_printed', False):
+                self._dbg_dave_methods_printed = True
+                try:
+                    methods = [m for m in dir(dave_session) if not m.startswith('_')]
+                    print(f"   🔬 DaveSession methods: {methods}")
+                except Exception:
+                    pass
             if not hasattr(self, '_dbg_dave_err_count'):
                 self._dbg_dave_err_count = 0
             self._dbg_dave_err_count += 1
             if self._dbg_dave_err_count <= 5:
                 print(f"   ⚠️ DAVE decrypt error ({type(e).__name__}): {e}")
-            return None
+            # Don't return None — fall through with whatever opus_data we have
+            # (if transport decrypt succeeded, raw opus is still usable when DAVE is in passthrough)
 
         return (ssrc, opus_data)
 
@@ -815,7 +841,7 @@ async def monitor():
 
             print(f"🎯 Joining '{target.name}' in '{guild.name}'...")
             try:
-                new_vc  = await target.connect(timeout=60.0, self_deaf=True)
+                new_vc  = await target.connect(timeout=60.0, self_deaf=False)
                 session = RecordingSession(new_vc)
                 session.start()
                 active_sessions[gid] = session
