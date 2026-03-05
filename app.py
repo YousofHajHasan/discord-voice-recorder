@@ -558,7 +558,17 @@ class VoiceReceiver:
 
         try:
             mode       = self._conn.mode
-            secret_key = bytes(self._conn.secret_key)
+            # secret_key may be list[int] from JSON — normalise to bytes safely
+            raw_key = self._conn.secret_key
+            if isinstance(raw_key, (list, tuple)):
+                secret_key = bytes(raw_key)
+            else:
+                secret_key = bytes(raw_key)
+
+            # Log key info once for debugging
+            if not getattr(self, '_dbg_key_logged', False):
+                self._dbg_key_logged = True
+                print(f'   SECRET_KEY: type={type(raw_key).__name__} len={len(secret_key)} first4={secret_key[:4].hex()}')
 
             if mode == 'aead_xchacha20_poly1305_rtpsize':
                 opus = self._decrypt_aead_xchacha20(full_header, encrypted_data, secret_key)
@@ -583,7 +593,7 @@ class VoiceReceiver:
                 print(
                     f"   Transport decrypt #{self._transport_err_count}: "
                     f"{type(e).__name__}: {e} "
-                    f"(mode={mode_str} payload_offset={payload_offset} "
+                    f"(mode={mode_str} header_size={header_size} "
                     f"enc_len={len(encrypted_data)} total={len(data)})"
                 )
             return None
@@ -593,23 +603,36 @@ class VoiceReceiver:
 
         return (ssrc, opus)
 
-    def _decrypt_aead_xchacha20(self, fixed_header: bytes, encrypted_payload: bytes, key: bytes) -> bytes:
+    def _decrypt_aead_xchacha20(self, full_header: bytes, encrypted_payload: bytes, key: bytes) -> bytes:
         """
-        aead_xchacha20_poly1305_rtpsize packet layout (from discord.py voice_client.py source):
-          On-wire: [full RTP header (12+4*CC bytes)] [nacl ciphertext+MAC] [4-byte nonce]
+        aead_xchacha20_poly1305_rtpsize:
+          On-wire: [full RTP header (12 + ext bytes)] [nacl ciphertext+MAC] [4-byte nonce LE counter]
 
-          So given encrypted_payload = data[payload_offset:]:
-            nonce   = last 4 bytes of encrypted_payload, zero-padded to 24 bytes
-            cipher  = encrypted_payload[:-4]   (nacl ciphertext including 16-byte MAC)
-            AAD     = the full RTP header passed as `fixed_header` (all payload_offset bytes,
-                      including CSRC list — this is what discord.py passes as `header` to encrypt)
+          Nonce = last 4 bytes of packet, zero-padded to 24 bytes.
+          Ciphertext = data[header_size:-4].
+          AAD = tries both 12-byte fixed header and full header, since Discord spec is ambiguous
+                about whether the RTP extension bytes are included in the AAD.
         """
         nonce_bytes = encrypted_payload[-4:]
         ciphertext  = encrypted_payload[:-4]
         nonce       = bytearray(24)
         nonce[:4]   = nonce_bytes
         box = nacl.secret.Aead(key)
-        return box.decrypt(bytes(ciphertext), bytes(fixed_header), bytes(nonce))
+
+        # Try AAD = full header first (includes extension bytes if present)
+        try:
+            return box.decrypt(bytes(ciphertext), bytes(full_header), bytes(nonce))
+        except Exception:
+            pass
+
+        # Fallback: AAD = only the fixed 12-byte RTP header (strips extension)
+        try:
+            return box.decrypt(bytes(ciphertext), bytes(full_header[:12]), bytes(nonce))
+        except Exception:
+            pass
+
+        # Last resort: no AAD
+        return box.decrypt(bytes(ciphertext), b"", bytes(nonce))
 
     def _decrypt_xsalsa20(self, fixed_header: bytes, encrypted: bytes, key: bytes) -> bytes:
         box   = nacl.secret.SecretBox(key)
