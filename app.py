@@ -291,6 +291,7 @@ class DaveSessionManager:
         self._pending_transitions: dict = {}  # transition_id -> version
         self._ready     = False
         self._hooked    = False
+        self._hooked_ws = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -357,6 +358,27 @@ class DaveSessionManager:
     # WS hook / unhook
     # ------------------------------------------------------------------
 
+    def rehook_if_needed(self):
+        """
+        Call this whenever the voice connection (re)connects.
+        discord.py replaces the WS object on every reconnect, so any hook
+        attached to the old WS is silently orphaned. This detects that and
+        re-applies the hook to the new WS object.
+        """
+        if not DAVE_AVAILABLE:
+            return
+        try:
+            ws = self.vc._connection.ws
+        except Exception:
+            return
+        if ws is None:
+            return
+        if getattr(ws, '__dave_hooked__', False):
+            return  # already hooked on this WS object
+        # Unhook old WS (best-effort), then hook new one
+        self._unhook_ws()
+        self._hook_ws()
+
     def _hook_ws(self):
         try:
             ws = self.vc._connection.ws
@@ -368,12 +390,12 @@ class DaveSessionManager:
             return
 
         if getattr(ws, '__dave_hooked__', False):
-            print("   [DAVE] WS already hooked")
+            print("   [DAVE] WS already hooked on this object")
             return
 
         original = ws.received_message
         manager  = self
-        print(f"   [DAVE] Hooking voice WS ({type(ws).__name__})")
+        print(f"   [DAVE] Hooking voice WS ({type(ws).__name__}) id={id(ws)}")
 
         async def patched(msg):
             # Binary frames carry DAVE opcodes
@@ -384,20 +406,26 @@ class DaveSessionManager:
         ws.__dave_hooked__           = True
         ws.__dave_original_handler__ = original
         ws.received_message          = patched
-        self._hooked = True
+        self._hooked    = True
+        self._hooked_ws = ws   # remember which WS object we're attached to
 
     def _unhook_ws(self):
-        if not self._hooked:
-            return
-        try:
-            ws = self.vc._connection.ws
-            if ws and hasattr(ws, '__dave_original_handler__'):
+        # Unhook from the specific WS we hooked (may differ from current WS after reconnect)
+        ws = getattr(self, '_hooked_ws', None)
+        if ws is None and self._hooked:
+            try:
+                ws = self.vc._connection.ws
+            except Exception:
+                pass
+        if ws and hasattr(ws, '__dave_original_handler__'):
+            try:
                 ws.received_message = ws.__dave_original_handler__
                 del ws.__dave_original_handler__
                 del ws.__dave_hooked__
-        except Exception:
-            pass
-        self._hooked = False
+            except Exception:
+                pass
+        self._hooked    = False
+        self._hooked_ws = None
 
     # ------------------------------------------------------------------
     # Binary opcode handler
@@ -714,6 +742,20 @@ class VoiceReceiver:
     # WS hook for SPEAKING events (SSRC → user_id mapping)
     # ------------------------------------------------------------------
 
+    def rehook_speaking_if_needed(self):
+        """Re-hook SPEAKING events if discord.py replaced the WS object after a reconnect."""
+        try:
+            ws = self._conn.ws
+        except Exception:
+            return
+        if ws is None:
+            return
+        if getattr(ws, '__speaking_hooked__', False):
+            return  # still hooked to this WS
+        print("   🔄 Re-hooking SPEAKING events after WS replacement")
+        self._unhook_ws_speaking()
+        self._hook_ws_speaking()
+
     def _hook_ws_speaking(self):
         try:
             ws = self._conn.ws
@@ -767,16 +809,23 @@ class VoiceReceiver:
         ws.__speaking_hooked__           = True
         ws.__speaking_original_handler__ = original
         ws.received_message              = patched
+        self._speaking_hooked_ws = ws
 
     def _unhook_ws_speaking(self):
-        try:
-            ws = self._conn.ws
-            if ws and hasattr(ws, '__speaking_original_handler__'):
+        ws = getattr(self, '_speaking_hooked_ws', None)
+        if ws is None:
+            try:
+                ws = self._conn.ws
+            except Exception:
+                return
+        if ws and hasattr(ws, '__speaking_original_handler__'):
+            try:
                 ws.received_message = ws.__speaking_original_handler__
                 del ws.__speaking_original_handler__
                 del ws.__speaking_hooked__
-        except Exception:
-            pass
+            except Exception:
+                pass
+        self._speaking_hooked_ws = None
 
     # ------------------------------------------------------------------
     # RTP / decrypt / decode pipeline
@@ -917,12 +966,16 @@ class VoiceReceiver:
         return (ssrc, opus)
 
     def _decrypt_aead_xchacha20(self, header: bytes, after_header: bytes, key: bytes) -> bytes:
+        # AAD for aead_xchacha20_poly1305_rtpsize is ALWAYS the fixed 12-byte RTP header.
+        # CSRC list and extension bytes are NOT part of the AAD — only the base header.
+        # Passing the full extended header as AAD causes CryptoError when CC > 0.
+        aad         = header[:12]
         nonce_bytes = after_header[-4:]
         encrypted   = after_header[:-4]
         nonce       = bytearray(24)
         nonce[:4]   = nonce_bytes
         box = nacl.secret.Aead(key)
-        return box.decrypt(bytes(encrypted), bytes(header), bytes(nonce))
+        return box.decrypt(bytes(encrypted), bytes(aad), bytes(nonce))
 
     def _decrypt_xsalsa20(self, header: bytes, encrypted: bytes, key: bytes) -> bytes:
         box   = nacl.secret.SecretBox(key)
@@ -1135,6 +1188,11 @@ async def monitor():
                 set_state(gid, State.IDLE)
                 guild_cooldown[gid] = now + LEAVE_COOLDOWN
                 continue
+
+            # Re-hook DAVE/SPEAKING on the new WS if discord.py reconnected silently
+            if session:
+                session.dave.rehook_if_needed()
+                session.receiver.rehook_speaking_if_needed()
 
             if not channel_has_target(vc.channel):
                 print(f"No targets left in '{vc.channel.name}' — leaving.")
