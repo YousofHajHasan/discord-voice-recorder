@@ -1,4 +1,12 @@
-discord.py[voice]>=2.7.1
-davey
+# discord.py master branch required for DAVE support (davey integration)
+# The released 2.4.x has no DAVE; DAVE was added in the unreleased master
+git+https://github.com/Rapptz/discord.py.git@master#egg=discord.py[voice]
+
+# DAVE / MLS E2EE decryption
+davey>=0.1.4
+
+# Transport encryption
 pynacl
+
+# Environment config
 python-dotenv

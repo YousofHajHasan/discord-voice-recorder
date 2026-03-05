@@ -17,7 +17,21 @@ from enum import Enum, auto
 import nacl.secret
 import nacl.utils
 
+# DAVE / davey import — graceful fallback so code loads even without the package
+try:
+    import davey
+    DAVE_AVAILABLE = True
+    print("✅ davey package loaded successfully")
+except ImportError:
+    davey = None
+    DAVE_AVAILABLE = False
+    print("⚠️  davey package NOT available — DAVE decryption will be skipped (audio may be garbage on E2EE channels)")
+
 _log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 # ==============================================================================
 # CONFIGURATION
@@ -59,9 +73,9 @@ print(f"   User whitelist : {ALLOWED_USERS or 'EMPTY — no one will be recorded
 # ==============================================================================
 
 class State(Enum):
-    IDLE      = auto()   # Not in any VC. Monitor loop scans for a target.
-    RECORDING = auto()   # In a VC and actively recording.
-    SAVING    = auto()   # Saving in progress; waiting to finish.
+    IDLE      = auto()
+    RECORDING = auto()
+    SAVING    = auto()
 
 guild_state:       dict = {}
 guild_cooldown:    dict = {}
@@ -119,7 +133,6 @@ def user_folder(user_id: int, user_name: str) -> str:
     return path
 
 def merge_chunks(folder: str, date_str: str):
-    """Concatenates all *_part*.mp3 files into YYYY-MM-DD.mp3, then deletes parts."""
     chunks = sorted(glob.glob(os.path.join(folder, "*_part*.mp3")))
     if not chunks:
         return
@@ -153,8 +166,7 @@ def merge_chunks(folder: str, date_str: str):
             os.remove(chunk)
 
 def startup_cleanup():
-    """On startup: merge any unmerged chunks from previous sessions."""
-    print(f"�� Startup cleanup on '{BASE_DIR}'...")
+    print(f"🔍 Startup cleanup on '{BASE_DIR}'...")
     os.makedirs(BASE_DIR, exist_ok=True)
 
     folders = [
@@ -177,14 +189,11 @@ def startup_cleanup():
 
     print("✅ Startup cleanup done.")
 
-
 # ==============================================================================
-# VOICE RECEIVE INFRASTRUCTURE  (replaces pycord's Sink system)
+# AUDIO BUFFER
 # ==============================================================================
 
 class AudioBuffer:
-    """Holds raw PCM audio data for one user, thread-safe."""
-
     def __init__(self):
         self._buf = io.BytesIO()
         self._lock = threading.Lock()
@@ -206,12 +215,10 @@ class AudioBuffer:
     @property
     def empty(self) -> bool:
         with self._lock:
-            pos = self._buf.tell()
-            return pos == 0
+            return self._buf.tell() == 0
 
 
 def pcm_to_mp3(pcm_data: bytes) -> bytes:
-    """Convert raw 16-bit 48kHz stereo PCM to MP3 via ffmpeg."""
     if not pcm_data:
         return b''
     process = subprocess.Popen(
@@ -226,378 +233,731 @@ def pcm_to_mp3(pcm_data: bytes) -> bytes:
     mp3_data, _ = process.communicate(input=pcm_data)
     return mp3_data
 
+# ==============================================================================
+# DAVE SESSION MANAGER
+# ==============================================================================
+
+class DaveSessionManager:
+    """
+    Manages the davey.Session lifecycle for one VoiceClient.
+
+    The voice websocket carries DAVE protocol opcodes as binary frames.
+    We monkey-patch the VoiceWebSocket.received_message to intercept them.
+
+    Relevant opcodes (from Discord docs / discord.py gateway.py source):
+      21 = DAVE_PROTOCOL_PREPARE_TRANSITION   (downgrade to version 0)
+      22 = DAVE_PROTOCOL_EXECUTE_TRANSITION
+      23 = DAVE_PROTOCOL_TRANSITION_READY     (we SEND this)
+      24 = DAVE_PROTOCOL_PREPARE_EPOCH
+      25 = DAVE_MLS_EXTERNAL_SENDER
+      26 = DAVE_MLS_KEY_PACKAGE               (we SEND this)
+      27 = DAVE_MLS_PROPOSALS
+      28 = DAVE_MLS_COMMIT_WELCOME            (we SEND this)
+      29 = DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION
+      30 = DAVE_MLS_WELCOME
+
+    davey Python API (mirrors the JS npm package @snazzah/davey):
+      davey.Session(version, user_id_str, channel_id_str)
+      session.set_external_sender(bytes)
+      session.get_serialized_key_package() -> bytes
+      session.process_proposals(op_type, proposals_bytes) -> CommitWelcome | None
+      session.process_commit(commit_bytes)
+      session.process_welcome(welcome_bytes)
+      session.create_key_ratchet(user_id_str) -> KeyRatchet
+      ratchet.decrypt(frame_bytes) -> bytes    # DAVE frame decrypt
+      davey.ProposalsOperationType.APPEND / REVOKE
+    """
+
+    # Voice WS opcodes
+    OP_DAVE_PREPARE_TRANSITION          = 21
+    OP_DAVE_EXECUTE_TRANSITION          = 22
+    OP_DAVE_TRANSITION_READY            = 23
+    OP_DAVE_PREPARE_EPOCH               = 24
+    OP_DAVE_MLS_EXTERNAL_SENDER         = 25
+    OP_DAVE_MLS_KEY_PACKAGE             = 26
+    OP_DAVE_MLS_PROPOSALS               = 27
+    OP_DAVE_MLS_COMMIT_WELCOME          = 28
+    OP_DAVE_MLS_ANNOUNCE_COMMIT         = 29
+    OP_DAVE_MLS_WELCOME                 = 30
+
+    def __init__(self, vc: discord.VoiceClient, user_id: int, channel_id: int):
+        self.vc         = vc
+        self.user_id    = user_id
+        self.channel_id = channel_id
+        self._lock      = threading.Lock()
+        self._session   = None          # davey.Session instance
+        self._version   = 0             # current DAVE protocol version
+        self._ratchets: dict = {}       # user_id_str -> KeyRatchet
+        self._pending_transitions: dict = {}  # transition_id -> version
+        self._ready     = False
+        self._hooked    = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self):
+        if not DAVE_AVAILABLE:
+            print("   [DAVE] davey not available, skipping DAVE setup")
+            return
+        self._hook_ws()
+        print(f"   [DAVE] DaveSessionManager started (user={self.user_id}, channel={self.channel_id})")
+
+    def stop(self):
+        self._unhook_ws()
+        with self._lock:
+            self._session = None
+            self._ratchets.clear()
+            self._ready = False
+        print("   [DAVE] DaveSessionManager stopped")
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready and self._session is not None
+
+    # ------------------------------------------------------------------
+    # Frame decryption (called from VoiceReceiver._on_packet per-user)
+    # ------------------------------------------------------------------
+
+    def decrypt_frame(self, opus_data: bytes, ssrc_user_id_str: str) -> bytes:
+        """
+        Attempt DAVE frame decryption.
+        Returns decrypted bytes on success, or original bytes as fallback.
+        """
+        if not DAVE_AVAILABLE or not self._ready:
+            return opus_data
+
+        with self._lock:
+            ratchet = self._ratchets.get(ssrc_user_id_str)
+            if ratchet is None:
+                # Lazily create the ratchet for this user
+                if self._session is None:
+                    return opus_data
+                try:
+                    ratchet = self._session.create_key_ratchet(ssrc_user_id_str)
+                    self._ratchets[ssrc_user_id_str] = ratchet
+                    print(f"   [DAVE] Created key ratchet for user {ssrc_user_id_str}")
+                except Exception as e:
+                    print(f"   [DAVE] ⚠️ create_key_ratchet({ssrc_user_id_str}) failed: {e}")
+                    return opus_data
+
+        try:
+            decrypted = ratchet.decrypt(opus_data)
+            return decrypted
+        except Exception as e:
+            # Throttle log spam
+            if not hasattr(self, '_decrypt_err_count'):
+                self._decrypt_err_count = 0
+            self._decrypt_err_count += 1
+            if self._decrypt_err_count <= 10 or self._decrypt_err_count % 500 == 0:
+                print(f"   [DAVE] ⚠️ decrypt_frame failed for {ssrc_user_id_str} (#{self._decrypt_err_count}): {e}")
+            return opus_data  # fallback: pass undecrypted to Opus decoder (will fail, but at least won't crash)
+
+    # ------------------------------------------------------------------
+    # WS hook / unhook
+    # ------------------------------------------------------------------
+
+    def _hook_ws(self):
+        try:
+            ws = self.vc._connection.ws
+            if ws is None:
+                print("   [DAVE] ⚠️ Voice WS is None, cannot hook")
+                return
+        except Exception as e:
+            print(f"   [DAVE] ⚠️ Cannot access voice WS: {e}")
+            return
+
+        if getattr(ws, '__dave_hooked__', False):
+            print("   [DAVE] WS already hooked")
+            return
+
+        original = ws.received_message
+        manager  = self
+        print(f"   [DAVE] Hooking voice WS ({type(ws).__name__})")
+
+        async def patched(msg):
+            # Binary frames carry DAVE opcodes
+            if isinstance(msg, (bytes, bytearray)):
+                await manager._handle_binary_op(ws, bytes(msg))
+            return await original(msg)
+
+        ws.__dave_hooked__           = True
+        ws.__dave_original_handler__ = original
+        ws.received_message          = patched
+        self._hooked = True
+
+    def _unhook_ws(self):
+        if not self._hooked:
+            return
+        try:
+            ws = self.vc._connection.ws
+            if ws and hasattr(ws, '__dave_original_handler__'):
+                ws.received_message = ws.__dave_original_handler__
+                del ws.__dave_original_handler__
+                del ws.__dave_hooked__
+        except Exception:
+            pass
+        self._hooked = False
+
+    # ------------------------------------------------------------------
+    # Binary opcode handler
+    # ------------------------------------------------------------------
+
+    async def _handle_binary_op(self, ws, data: bytes):
+        """
+        Binary voice WS frame format (from Discord docs):
+          [1 byte seq_ack_flag?] [2 bytes seq (big-endian, optional)] [1 byte opcode] [payload...]
+        discord.py gateway.py shows:  seq = struct.unpack_from('>H', msg, 1)[0], op = msg[3], payload = msg[5:]
+        i.e.  byte 0 = ? (ignored), bytes 1-2 = seq, byte 3 = op, bytes 4+ = payload
+        Actually from discord.py source: seq is at offset 1 (2 bytes), op at offset 3, payload at offset 4.
+        But some frames omit the seq entirely. We try both layouts.
+        """
+        if len(data) < 2:
+            return
+
+        # Layout: [flags(1)] [seq(2)] [op(1)] [payload...]
+        if len(data) >= 4:
+            op      = data[3]
+            payload = data[4:]
+        else:
+            op      = data[1]
+            payload = data[2:]
+
+        print(f"   [DAVE] Binary op={op} payload_len={len(payload)}")
+
+        if op == self.OP_DAVE_PREPARE_EPOCH:
+            await self._on_prepare_epoch(ws, payload)
+
+        elif op == self.OP_DAVE_MLS_EXTERNAL_SENDER:
+            await self._on_external_sender(ws, payload)
+
+        elif op == self.OP_DAVE_MLS_PROPOSALS:
+            await self._on_proposals(ws, payload)
+
+        elif op == self.OP_DAVE_MLS_ANNOUNCE_COMMIT:
+            await self._on_commit_transition(ws, payload)
+
+        elif op == self.OP_DAVE_MLS_WELCOME:
+            await self._on_welcome(ws, payload)
+
+        elif op == self.OP_DAVE_EXECUTE_TRANSITION:
+            await self._on_execute_transition(ws, payload)
+
+        elif op == self.OP_DAVE_PREPARE_TRANSITION:
+            await self._on_prepare_transition(ws, payload)
+
+    # ------------------------------------------------------------------
+    # DAVE opcode handlers
+    # ------------------------------------------------------------------
+
+    async def _on_prepare_epoch(self, ws, payload: bytes):
+        """
+        Opcode 24 — DAVE Protocol Prepare Epoch.
+        Payload: [1 byte epoch_id? / version?] possibly just signals that a new MLS group needs to be created.
+        discord.py gateway.py: epoch == 1 → create a new MLS group.
+        """
+        if not DAVE_AVAILABLE:
+            return
+        if len(payload) < 3:
+            print(f"   [DAVE] OP_PREPARE_EPOCH: payload too short ({len(payload)} bytes), raw={payload.hex()}")
+            return
+
+        # Layout from discord.py gateway.py: epoch_id at offset 0 (1 byte), version at offset 1 (2 bytes big-endian)
+        epoch_id = payload[0]
+        version  = struct.unpack_from('>H', payload, 1)[0] if len(payload) >= 3 else 1
+
+        print(f"   [DAVE] Prepare epoch: epoch_id={epoch_id} version={version}")
+
+        with self._lock:
+            self._version = version
+            self._ratchets.clear()  # Keys are invalid for the new epoch
+
+        try:
+            with self._lock:
+                self._session = davey.Session(
+                    version,
+                    str(self.user_id),
+                    str(self.channel_id),
+                )
+            key_package = self._session.get_serialized_key_package()
+            print(f"   [DAVE] Created new Session v{version}, key_package={len(key_package)} bytes")
+
+            # Send OP 26 MLS Key Package
+            await self._send_binary(ws, self.OP_DAVE_MLS_KEY_PACKAGE, key_package)
+
+        except Exception as e:
+            print(f"   [DAVE] ❌ Failed to create davey.Session: {e}")
+            import traceback; traceback.print_exc()
+
+    async def _on_external_sender(self, ws, payload: bytes):
+        """Opcode 25 — set the external sender blob."""
+        if not DAVE_AVAILABLE or self._session is None:
+            return
+        try:
+            self._session.set_external_sender(payload)
+            print(f"   [DAVE] External sender set ({len(payload)} bytes)")
+        except Exception as e:
+            print(f"   [DAVE] ⚠️ set_external_sender failed: {e}")
+
+    async def _on_proposals(self, ws, payload: bytes):
+        """
+        Opcode 27 — MLS Proposals.
+        Payload: [1 byte op_type (0=append,1=revoke)] [proposals_bytes...]
+        discord.py gateway.py shows optype = payload[0], proposals = payload[1:] (but discord.py uses msg[4:] with different offsets — we need to check)
+        Actually from discord.py: optype = struct.unpack_from('B', msg, 4)[0], proposals = msg[5:]
+        Since we already stripped the 4-byte header in _handle_binary_op, payload here = msg[4:], so optype = payload[0], data = payload[1:]
+        """
+        if not DAVE_AVAILABLE or self._session is None:
+            return
+
+        if len(payload) < 1:
+            print(f"   [DAVE] OP_PROPOSALS: empty payload")
+            return
+
+        optype_byte = payload[0]
+        proposals_data = payload[1:]
+
+        op_type = (davey.ProposalsOperationType.APPEND
+                   if optype_byte == 0
+                   else davey.ProposalsOperationType.REVOKE)
+
+        print(f"   [DAVE] Processing proposals: op={optype_byte} data={len(proposals_data)} bytes")
+
+        try:
+            result = self._session.process_proposals(op_type, proposals_data)
+            if result is not None:
+                # result is a CommitWelcome object
+                commit_bytes  = result.commit
+                welcome_bytes = result.welcome  # may be None
+                payload_out   = commit_bytes + welcome_bytes if welcome_bytes else commit_bytes
+                await self._send_binary(ws, self.OP_DAVE_MLS_COMMIT_WELCOME, payload_out)
+                print(f"   [DAVE] Sent CommitWelcome: commit={len(commit_bytes)}b welcome={len(welcome_bytes) if welcome_bytes else 0}b")
+        except Exception as e:
+            print(f"   [DAVE] ⚠️ process_proposals failed: {e}")
+            import traceback; traceback.print_exc()
+
+    async def _on_commit_transition(self, ws, payload: bytes):
+        """
+        Opcode 29 — MLS Announce Commit Transition (existing members).
+        Payload: [2 bytes transition_id big-endian] [commit_bytes...]
+        discord.py: transition_id = struct.unpack_from('>H', msg, 3)[0], commit = msg[5:]
+        With our offset adjustment: transition_id at payload[0:2], commit at payload[2:]
+        """
+        if not DAVE_AVAILABLE or self._session is None:
+            return
+
+        if len(payload) < 2:
+            print(f"   [DAVE] OP_ANNOUNCE_COMMIT: payload too short")
+            return
+
+        transition_id = struct.unpack_from('>H', payload, 0)[0]
+        commit_data   = payload[2:]
+
+        print(f"   [DAVE] Processing commit: transition_id={transition_id} commit={len(commit_data)} bytes")
+
+        try:
+            self._session.process_commit(commit_data)
+            with self._lock:
+                if transition_id != 0:
+                    self._pending_transitions[transition_id] = self._version
+                self._ratchets.clear()  # All ratchets invalidated on commit
+            # Signal ready
+            await self._send_transition_ready(ws, transition_id)
+            print(f"   [DAVE] Commit processed, sent transition ready (id={transition_id})")
+        except Exception as e:
+            print(f"   [DAVE] ⚠️ process_commit failed: {e}")
+            import traceback; traceback.print_exc()
+
+    async def _on_welcome(self, ws, payload: bytes):
+        """
+        Opcode 30 — MLS Welcome (new members being added to group).
+        Payload: [2 bytes transition_id] [welcome_bytes...]
+        """
+        if not DAVE_AVAILABLE or self._session is None:
+            return
+
+        if len(payload) < 2:
+            print(f"   [DAVE] OP_WELCOME: payload too short")
+            return
+
+        transition_id = struct.unpack_from('>H', payload, 0)[0]
+        welcome_data  = payload[2:]
+
+        print(f"   [DAVE] Processing welcome: transition_id={transition_id} welcome={len(welcome_data)} bytes")
+
+        try:
+            self._session.process_welcome(welcome_data)
+            with self._lock:
+                if transition_id != 0:
+                    self._pending_transitions[transition_id] = self._version
+                self._ratchets.clear()
+            await self._send_transition_ready(ws, transition_id)
+            print(f"   [DAVE] Welcome processed, sent transition ready (id={transition_id})")
+        except Exception as e:
+            print(f"   [DAVE] ⚠️ process_welcome failed: {e}")
+            import traceback; traceback.print_exc()
+
+    async def _on_execute_transition(self, ws, payload: bytes):
+        """
+        Opcode 22 — Execute Transition.
+        After this, senders use the new protocol version / key ratchet.
+        """
+        if len(payload) >= 2:
+            transition_id = struct.unpack_from('>H', payload, 0)[0]
+        else:
+            transition_id = 0
+
+        print(f"   [DAVE] Execute transition id={transition_id}")
+
+        with self._lock:
+            if transition_id in self._pending_transitions:
+                del self._pending_transitions[transition_id]
+            self._ready = (self._session is not None)
+
+        print(f"   [DAVE] Session ready={self._ready}")
+
+    async def _on_prepare_transition(self, ws, payload: bytes):
+        """
+        Opcode 21 — Prepare Transition (downgrade to protocol version 0).
+        We clear the session and signal ready.
+        """
+        if len(payload) >= 2:
+            transition_id = struct.unpack_from('>H', payload, 0)[0]
+        else:
+            transition_id = 0
+
+        print(f"   [DAVE] Prepare downgrade transition id={transition_id}")
+
+        with self._lock:
+            self._session = None
+            self._ratchets.clear()
+            self._ready   = False
+            self._version = 0
+
+        await self._send_transition_ready(ws, transition_id)
+
+    # ------------------------------------------------------------------
+    # Send helpers
+    # ------------------------------------------------------------------
+
+    async def _send_binary(self, ws, op: int, payload: bytes):
+        """Send a binary voice WS frame: [0x00] [seq=0x0000] [op] [payload]"""
+        frame = bytes([0x00, 0x00, 0x00, op]) + payload
+        try:
+            await ws.send_as_binary(frame)
+        except Exception as e:
+            print(f"   [DAVE] ⚠️ send_binary op={op} failed: {e}")
+
+    async def _send_transition_ready(self, ws, transition_id: int):
+        payload = struct.pack('>H', transition_id)
+        await self._send_binary(ws, self.OP_DAVE_TRANSITION_READY, payload)
+
+
+# ==============================================================================
+# VOICE RECEIVER
+# ==============================================================================
 
 class VoiceReceiver:
     """
-    Receives voice data from a discord.py VoiceClient using SocketReader callbacks.
+    Raw UDP socket listener that decrypts and decodes Discord voice packets.
 
-    The SocketReader delivers raw encrypted UDP packets. We:
-      1. Parse the 12-byte RTP header to extract SSRC
-      2. Strip the RTP header and encryption nonce/tag
-      3. Decrypt the payload using the connection's secret key + mode
-      4. DAVE-decrypt if DAVE session is active
-      5. Decode Opus -> PCM
-      6. Write PCM into per-user AudioBuffer (filtered by whitelist + pause)
-
-    SSRC->user_id mapping comes from the voice websocket's SPEAKING event (opcode 5).
-    We hook into this by monkey-patching the voice websocket's received_message handler.
+    Pipeline:
+      UDP packet → RTP parse → Transport decrypt (nacl) → DAVE decrypt (davey) → Opus decode → PCM buffer
     """
 
-    SILENCE_FRAME = b'\xf8\xff\xfe'  # Opus silence
+    SILENCE_FRAME = b'\xf8\xff\xfe'
 
-    def __init__(self, vc: discord.VoiceClient):
-        self.vc = vc
-        self._connection = vc._connection  # VoiceConnectionState
-        self.audio_data: dict[int, AudioBuffer] = {}  # user_id -> AudioBuffer
-        self._ssrc_to_user: dict[int, int] = {}       # ssrc -> user_id
-        self._decoders: dict = {}                      # ssrc -> OpusDecoder
-        self._lock = threading.Lock()
-        self._recording = False
+    def __init__(self, vc: discord.VoiceClient, dave_manager: 'DaveSessionManager'):
+        self.vc           = vc
+        self._conn        = vc._connection
+        self._dave        = dave_manager
+        self.audio_data: dict = {}       # user_id -> AudioBuffer
+        self._ssrc_to_user: dict = {}    # ssrc -> user_id
+        self._decoders: dict = {}        # ssrc -> OpusDecoder
+        self._lock        = threading.Lock()
+        self._recording   = False
+        self._dbg_total   = 0
+        self._dbg_ok      = 0
+        self._dbg_decrypt_fail = 0
+        self._dbg_no_ssrc = 0
+        self._dbg_not_whitelisted = 0
+        self._dbg_paused  = 0
+        self._dbg_silence = 0
+        self._dbg_decode_fail = 0
+        self._dbg_dave_fail = 0
+        self._dbg_last_log = 0
 
     def start(self):
-        """Start receiving voice packets."""
         self._recording = True
-        # Register our callback with the SocketReader
-        self._connection.add_socket_listener(self._on_packet)
-        # Hook into voice websocket to capture SPEAKING events for SSRC mapping
-        self._hook_voice_ws()
+        self._conn.add_socket_listener(self._on_packet)
+        self._hook_ws_speaking()
         try:
-            mode = self._connection.mode
+            mode = self._conn.mode
             print(f"   🎙️ VoiceReceiver started (mode={mode})")
         except Exception:
             print(f"   🎙️ VoiceReceiver started (mode=unknown)")
 
     def stop(self):
-        """Stop receiving voice packets."""
         self._recording = False
-        self._connection.remove_socket_listener(self._on_packet)
-        self._unhook_voice_ws()
+        try:
+            self._conn.remove_socket_listener(self._on_packet)
+        except Exception:
+            pass
+        self._unhook_ws_speaking()
         print(f"   🎙️ VoiceReceiver stopped")
 
     @property
     def is_recording(self) -> bool:
         return self._recording
 
-    def _hook_voice_ws(self):
-        """
-        Monkey-patch the voice websocket's received_message to intercept
-        SPEAKING (op 5), CLIENT_CONNECT (op 12), and CLIENT_DISCONNECT (op 13)
-        events, which provide the SSRC -> user_id mapping.
-        """
+    # ------------------------------------------------------------------
+    # WS hook for SPEAKING events (SSRC → user_id mapping)
+    # ------------------------------------------------------------------
+
+    def _hook_ws_speaking(self):
         try:
-            ws = self._connection.ws
-            if ws is None or (hasattr(ws, '__class__') and ws.__class__.__name__ == '_MissingSentinel'):
-                print("   ⚠️ Voice WS not available yet (MISSING)")
+            ws = self._conn.ws
+            if ws is None:
+                print("   ⚠️ Voice WS not available for SPEAKING hook")
                 return
         except Exception as e:
-            print(f"   ⚠️ Cannot hook voice WS: {e}")
+            print(f"   ⚠️ Cannot hook SPEAKING: {e}")
             return
 
-        if hasattr(ws, '__voice_receiver_hooked__'):
-            print("   ℹ️ Voice WS already hooked")
+        if getattr(ws, '__speaking_hooked__', False):
+            print("   ℹ️ SPEAKING hook already in place")
             return
 
-        print(f"   🔗 Hooking voice WS: {type(ws).__name__}")
-        original = ws.received_message
-        receiver = self
+        original  = ws.received_message
+        receiver  = self
+        print(f"   🔗 Hooking SPEAKING events on {type(ws).__name__}")
 
-        async def patched_received_message(msg: dict):
-            # Intercept before passing to original handler
-            try:
-                op = msg.get('op')
+        async def patched(msg: dict):
+            if isinstance(msg, dict):
+                op   = msg.get('op')
                 data = msg.get('d', {})
-                if op == 5:  # SPEAKING
-                    ssrc = data.get('ssrc')
+                if op == 5:   # SPEAKING
+                    ssrc    = data.get('ssrc')
                     user_id = data.get('user_id')
                     if ssrc is not None and user_id is not None:
                         user_id = int(user_id)
                         with receiver._lock:
                             receiver._ssrc_to_user[ssrc] = user_id
-                        print(f"   🔊 SPEAKING: ssrc={ssrc} -> user_id={user_id}")
+                        print(f"   🔊 SPEAKING map: ssrc={ssrc} → user_id={user_id}")
                 elif op == 12:  # CLIENT_CONNECT
-                    ssrc = data.get('audio_ssrc')
+                    ssrc    = data.get('audio_ssrc')
                     user_id = data.get('user_id')
-                    if ssrc is not None and user_id is not None:
+                    if ssrc and user_id:
                         user_id = int(user_id)
                         with receiver._lock:
                             receiver._ssrc_to_user[ssrc] = user_id
-                        print(f"   🔗 CLIENT_CONNECT: ssrc={ssrc} -> user_id={user_id}")
+                        print(f"   🔗 CLIENT_CONNECT: ssrc={ssrc} → user_id={user_id}")
                 elif op == 13:  # CLIENT_DISCONNECT
                     user_id = data.get('user_id')
-                    if user_id is not None:
+                    if user_id:
                         user_id = int(user_id)
                         with receiver._lock:
-                            to_remove = [s for s, u in receiver._ssrc_to_user.items() if u == user_id]
-                            for s in to_remove:
+                            to_rm = [s for s, u in receiver._ssrc_to_user.items() if u == user_id]
+                            for s in to_rm:
                                 del receiver._ssrc_to_user[s]
                                 receiver._decoders.pop(s, None)
                         print(f"   🔌 CLIENT_DISCONNECT: user_id={user_id}")
-            except Exception as e:
-                print(f"   ⚠️ Error in WS intercept: {e}")
-
             return await original(msg)
 
-        ws.__voice_receiver_hooked__ = True
-        ws.__original_received_message__ = original
-        ws.received_message = patched_received_message
+        ws.__speaking_hooked__           = True
+        ws.__speaking_original_handler__ = original
+        ws.received_message              = patched
 
-    def _unhook_voice_ws(self):
-        """Restore the original received_message handler."""
+    def _unhook_ws_speaking(self):
         try:
-            ws = self._connection.ws
-            if hasattr(ws, '__original_received_message__'):
-                ws.received_message = ws.__original_received_message__
-                del ws.__original_received_message__
-            if hasattr(ws, '__voice_receiver_hooked__'):
-                del ws.__voice_receiver_hooked__
+            ws = self._conn.ws
+            if ws and hasattr(ws, '__speaking_original_handler__'):
+                ws.received_message = ws.__speaking_original_handler__
+                del ws.__speaking_original_handler__
+                del ws.__speaking_hooked__
         except Exception:
             pass
 
-    def _get_decoder(self, ssrc: int):
-        """Get or create an Opus decoder for an SSRC."""
-        if ssrc not in self._decoders:
-            self._decoders[ssrc] = discord_opus.Decoder()
-        return self._decoders[ssrc]
-
-    def _decrypt_packet(self, data: bytes):
-        """
-        Parse RTP header, decrypt the voice payload.
-        Returns (ssrc, opus_data) or None on failure.
-
-        For 'rtpsize' modes the unencrypted header (= AAD for AEAD) is
-        determined the same way as SRTP (RFC 3711 §3.1):
-          - 12-byte fixed header
-          - 4 × CC bytes of CSRC list  (CC = lower 4 bits of byte 0)
-          - if extension bit (X, bit 4 of byte 0) is set: 4-byte
-            extension preamble (profile-specific ID + length)
-        Everything after that unencrypted header is ciphertext + nonce.
-        """
-        if len(data) < 12:
-            return None
-
-        # Filter out RTCP control packets (payload type 200-204).
-        # RTP audio has PT=120 (0x78); RTCP uses PT in range 200-204.
-        pt = data[1] & 0x7F
-        if pt >= 200:
-            return None
-
-        # --- Parse fixed 12-byte RTP header ---
-        ssrc = struct.unpack_from('>I', data, 8)[0]
-
-        # Skip our own SSRC
-        try:
-            if ssrc == self._connection.ssrc:
-                return None
-        except Exception:
-            pass
-
-        # --- Compute unencrypted header size (rtpsize rule) ---
-        byte0 = data[0]
-        cc = byte0 & 0x0F             # CSRC count
-        has_extension = byte0 & 0x10  # extension bit (X)
-        header_len = 12 + 4 * cc
-        if has_extension:
-            header_len += 4           # 4-byte extension preamble
-
-        if len(data) <= header_len:
-            return None
-
-        header = bytes(data[:header_len])
-        encrypted_data = data[header_len:]
-
-        # Debug: log first packet header details
-        if not hasattr(self, '_dbg_hdr_logged'):
-            self._dbg_hdr_logged = True
-            print(f"   🔎 First pkt: byte0=0x{byte0:02x} CC={cc} ext={bool(has_extension)} hdr_len={header_len} pkt_len={len(data)}")
-
-        # Decrypt based on encryption mode
-        try:
-            mode = self._connection.mode
-            secret_key = bytes(self._connection.secret_key)
-
-            if mode == 'aead_xchacha20_poly1305_rtpsize':
-                opus_data = self._decrypt_aead_xchacha20(header, encrypted_data, secret_key)
-            elif mode == 'xsalsa20_poly1305_lite':
-                opus_data = self._decrypt_xsalsa20_lite(encrypted_data, secret_key)
-            elif mode == 'xsalsa20_poly1305_suffix':
-                opus_data = self._decrypt_xsalsa20_suffix(encrypted_data, secret_key)
-            elif mode == 'xsalsa20_poly1305':
-                opus_data = self._decrypt_xsalsa20(header, encrypted_data, secret_key)
-            else:
-                if not hasattr(self, '_dbg_mode_warned'):
-                    print(f"   ⚠️ Unknown encryption mode: {mode}")
-                    self._dbg_mode_warned = True
-                return None
-        except Exception as e:
-            if not hasattr(self, '_dbg_decrypt_err_count'):
-                self._dbg_decrypt_err_count = 0
-            self._dbg_decrypt_err_count += 1
-            if self._dbg_decrypt_err_count <= 5:
-                print(f"   ⚠️ Decrypt error ({type(e).__name__}): {e} [mode={getattr(self._connection, 'mode', '?')}, hdr_len={header_len}, data_len={len(data)}]")
-            return None
-
-        if not opus_data:
-            return None
-
-        # DAVE decryption if session is active and ready (E2EE layer on top of transport)
-        try:
-            dave_session = self._connection.dave_session
-            if dave_session and self._connection.dave_protocol_version > 0 and getattr(dave_session, 'ready', False):
-                # Introspect available methods once so we can identify the correct name from logs
-                if not getattr(self, '_dbg_dave_methods_printed', False):
-                    self._dbg_dave_methods_printed = True
-                    methods = [m for m in dir(dave_session) if not m.startswith('_')]
-                    print(f"   🔬 DaveSession methods: {methods}")
-                # Try known decrypt method names in order of likelihood
-                if hasattr(dave_session, 'decrypt_media'):
-                    opus_data = dave_session.decrypt_media(opus_data, ssrc)
-                elif hasattr(dave_session, 'decrypt_opus'):
-                    opus_data = dave_session.decrypt_opus(opus_data, ssrc)
-                elif hasattr(dave_session, 'decrypt'):
-                    opus_data = dave_session.decrypt(opus_data, ssrc)
-                # else: passthrough — data is already plain opus (passthrough mode)
-        except Exception as e:
-            if not getattr(self, '_dbg_dave_methods_printed', False):
-                self._dbg_dave_methods_printed = True
-                try:
-                    methods = [m for m in dir(dave_session) if not m.startswith('_')]
-                    print(f"   🔬 DaveSession methods: {methods}")
-                except Exception:
-                    pass
-            if not hasattr(self, '_dbg_dave_err_count'):
-                self._dbg_dave_err_count = 0
-            self._dbg_dave_err_count += 1
-            if self._dbg_dave_err_count <= 5:
-                print(f"   ⚠️ DAVE decrypt error ({type(e).__name__}): {e}")
-            # Don't return None — fall through with whatever opus_data we have
-            # (if transport decrypt succeeded, raw opus is still usable when DAVE is in passthrough)
-
-        return (ssrc, opus_data)
-
-    def _decrypt_aead_xchacha20(self, header: bytes, after_header: bytes, secret_key: bytes) -> bytes:
-        """Decrypt aead_xchacha20_poly1305_rtpsize mode.
-        
-        AAD = full unencrypted RTP header (12 + CSRC + ext preamble).
-        Ciphertext = everything between header and the 4-byte nonce suffix.
-        """
-        nonce_bytes = after_header[-4:]
-        encrypted = after_header[:-4]
-        nonce = bytearray(24)
-        nonce[:4] = nonce_bytes
-        box = nacl.secret.Aead(secret_key)
-        return box.decrypt(bytes(encrypted), bytes(header), bytes(nonce))
-
-    def _decrypt_xsalsa20(self, header: bytes, encrypted_data: bytes, secret_key: bytes) -> bytes:
-        """Decrypt xsalsa20_poly1305 mode."""
-        box = nacl.secret.SecretBox(secret_key)
-        nonce = bytearray(24)
-        nonce[:12] = header[:12]
-        return box.decrypt(bytes(encrypted_data), bytes(nonce))
-
-    def _decrypt_xsalsa20_suffix(self, encrypted_data: bytes, secret_key: bytes) -> bytes:
-        """Decrypt xsalsa20_poly1305_suffix mode."""
-        box = nacl.secret.SecretBox(secret_key)
-        nonce = encrypted_data[-24:]
-        encrypted = encrypted_data[:-24]
-        return box.decrypt(bytes(encrypted), bytes(nonce))
-
-    def _decrypt_xsalsa20_lite(self, encrypted_data: bytes, secret_key: bytes) -> bytes:
-        """Decrypt xsalsa20_poly1305_lite mode."""
-        box = nacl.secret.SecretBox(secret_key)
-        nonce = bytearray(24)
-        nonce[:4] = encrypted_data[-4:]
-        encrypted = encrypted_data[:-4]
-        return box.decrypt(bytes(encrypted), bytes(nonce))
+    # ------------------------------------------------------------------
+    # RTP / decrypt / decode pipeline
+    # ------------------------------------------------------------------
 
     def _on_packet(self, data: bytes):
-        """
-        SocketReader callback - runs in the reader thread.
-        Receives raw encrypted UDP packets from the voice socket.
-        """
         if not self._recording:
             return
 
-        # Debug counters (throttled)
-        if not hasattr(self, '_dbg_total'):
-            self._dbg_total = 0
-            self._dbg_decrypt_fail = 0
-            self._dbg_no_ssrc = 0
-            self._dbg_not_whitelisted = 0
-            self._dbg_paused = 0
-            self._dbg_silence = 0
-            self._dbg_decode_fail = 0
-            self._dbg_ok = 0
-            self._dbg_last_log = 0
         self._dbg_total += 1
-
-        result = self._decrypt_packet(data)
+        result = self._decrypt_transport(data)
         if result is None:
             self._dbg_decrypt_fail += 1
-            self._dbg_maybe_log()
+            self._maybe_log()
             return
 
         ssrc, opus_data = result
 
-        # Map SSRC to user_id
         with self._lock:
             user_id = self._ssrc_to_user.get(ssrc)
 
         if user_id is None:
             self._dbg_no_ssrc += 1
-            self._dbg_maybe_log()
+            self._maybe_log()
             return
 
-        # Filter: only whitelisted, non-paused users
         if user_id not in ALLOWED_USERS:
             self._dbg_not_whitelisted += 1
-            self._dbg_maybe_log()
+            self._maybe_log()
             return
+
         if is_user_paused(user_id):
             self._dbg_paused += 1
-            self._dbg_maybe_log()
+            self._maybe_log()
             return
 
-        # Skip silence frames
         if opus_data == self.SILENCE_FRAME:
             self._dbg_silence += 1
-            self._dbg_maybe_log()
+            self._maybe_log()
             return
 
-        # Decode Opus to PCM
+        # DAVE frame decryption (E2EE layer)
+        if DAVE_AVAILABLE and self._dave.is_ready:
+            try:
+                opus_data = self._dave.decrypt_frame(opus_data, str(user_id))
+            except Exception as e:
+                self._dbg_dave_fail += 1
+                if self._dbg_dave_fail <= 5:
+                    print(f"   [DAVE] ⚠️ decrypt_frame exception: {e}")
+
+        # Opus → PCM
         try:
             decoder = self._get_decoder(ssrc)
-            pcm = decoder.decode(opus_data, fec=False)
+            pcm     = decoder.decode(opus_data, fec=False)
         except Exception as e:
             self._dbg_decode_fail += 1
-            if self._dbg_decode_fail <= 3:
-                print(f"   ⚠️ Opus decode error: {e}")
-            self._dbg_maybe_log()
+            if self._dbg_decode_fail <= 5:
+                print(f"   ⚠️ Opus decode error for ssrc={ssrc} user={user_id}: {e}")
+            self._maybe_log()
             return
 
         self._dbg_ok += 1
 
-        # Store in per-user buffer
         if user_id not in self.audio_data:
             self.audio_data[user_id] = AudioBuffer()
-            print(f"   📝 First audio packet for user {user_id}")
+            print(f"   📝 First audio stored for user {user_id}")
         self.audio_data[user_id].write(pcm)
-        self._dbg_maybe_log()
+        self._maybe_log()
 
-    def _dbg_maybe_log(self):
-        """Print debug stats every 30 seconds."""
+    def _get_decoder(self, ssrc: int):
+        if ssrc not in self._decoders:
+            self._decoders[ssrc] = discord_opus.Decoder()
+        return self._decoders[ssrc]
+
+    def _decrypt_transport(self, data: bytes):
+        """Parse RTP header and decrypt transport encryption layer."""
+        if len(data) < 12:
+            return None
+
+        pt = data[1] & 0x7F
+        if pt >= 200:  # RTCP
+            return None
+
+        ssrc = struct.unpack_from('>I', data, 8)[0]
+
+        try:
+            if ssrc == self._conn.ssrc:
+                return None
+        except Exception:
+            pass
+
+        byte0      = data[0]
+        cc         = byte0 & 0x0F
+        has_ext    = byte0 & 0x10
+        header_len = 12 + 4 * cc
+        if has_ext:
+            header_len += 4
+
+        if len(data) <= header_len:
+            return None
+
+        header         = bytes(data[:header_len])
+        encrypted_data = data[header_len:]
+
+        # Log first packet header info
+        if not hasattr(self, '_dbg_hdr_logged'):
+            self._dbg_hdr_logged = True
+            print(f"   🔎 First RTP pkt: byte0=0x{byte0:02x} CC={cc} ext={bool(has_ext)} hdr_len={header_len} total={len(data)}")
+
+        try:
+            mode       = self._conn.mode
+            secret_key = bytes(self._conn.secret_key)
+
+            if mode == 'aead_xchacha20_poly1305_rtpsize':
+                opus = self._decrypt_aead_xchacha20(header, encrypted_data, secret_key)
+            elif mode == 'xsalsa20_poly1305_lite':
+                opus = self._decrypt_xsalsa20_lite(encrypted_data, secret_key)
+            elif mode == 'xsalsa20_poly1305_suffix':
+                opus = self._decrypt_xsalsa20_suffix(encrypted_data, secret_key)
+            elif mode == 'xsalsa20_poly1305':
+                opus = self._decrypt_xsalsa20(header, encrypted_data, secret_key)
+            else:
+                if not hasattr(self, '_unknown_mode_warned'):
+                    print(f"   ⚠️ Unknown transport mode: {mode}")
+                    self._unknown_mode_warned = True
+                return None
+        except Exception as e:
+            if not hasattr(self, '_transport_err_count'):
+                self._transport_err_count = 0
+            self._transport_err_count += 1
+            if self._transport_err_count <= 5:
+                print(f"   ⚠️ Transport decrypt error: {type(e).__name__}: {e} (mode={getattr(self._conn,'mode','?')})")
+            return None
+
+        if not opus:
+            return None
+
+        return (ssrc, opus)
+
+    def _decrypt_aead_xchacha20(self, header: bytes, after_header: bytes, key: bytes) -> bytes:
+        nonce_bytes = after_header[-4:]
+        encrypted   = after_header[:-4]
+        nonce       = bytearray(24)
+        nonce[:4]   = nonce_bytes
+        box = nacl.secret.Aead(key)
+        return box.decrypt(bytes(encrypted), bytes(header), bytes(nonce))
+
+    def _decrypt_xsalsa20(self, header: bytes, encrypted: bytes, key: bytes) -> bytes:
+        box   = nacl.secret.SecretBox(key)
+        nonce = bytearray(24)
+        nonce[:12] = header[:12]
+        return box.decrypt(bytes(encrypted), bytes(nonce))
+
+    def _decrypt_xsalsa20_suffix(self, encrypted: bytes, key: bytes) -> bytes:
+        box   = nacl.secret.SecretBox(key)
+        nonce = encrypted[-24:]
+        data  = encrypted[:-24]
+        return box.decrypt(bytes(data), bytes(nonce))
+
+    def _decrypt_xsalsa20_lite(self, encrypted: bytes, key: bytes) -> bytes:
+        box   = nacl.secret.SecretBox(key)
+        nonce = bytearray(24)
+        nonce[:4] = encrypted[-4:]
+        data  = encrypted[:-4]
+        return box.decrypt(bytes(data), bytes(nonce))
+
+    def _maybe_log(self):
         now = time.time()
         if now - self._dbg_last_log < 30:
             return
         self._dbg_last_log = now
         with self._lock:
-            ssrc_map_size = len(self._ssrc_to_user)
             ssrc_map = dict(self._ssrc_to_user)
         print(
-            f"   📊 Packets: total={self._dbg_total} ok={self._dbg_ok} "
-            f"decrypt_fail={self._dbg_decrypt_fail} no_ssrc={self._dbg_no_ssrc} "
+            f"   📊 Packets total={self._dbg_total} ok={self._dbg_ok} "
+            f"transport_fail={self._dbg_decrypt_fail} no_ssrc={self._dbg_no_ssrc} "
             f"!whitelist={self._dbg_not_whitelisted} paused={self._dbg_paused} "
-            f"silence={self._dbg_silence} decode_fail={self._dbg_decode_fail} "
-            f"ssrc_map({ssrc_map_size})={ssrc_map}"
+            f"silence={self._dbg_silence} opus_fail={self._dbg_decode_fail} "
+            f"dave_fail={self._dbg_dave_fail} "
+            f"dave_ready={self._dave.is_ready} "
+            f"ssrc_map={ssrc_map}"
         )
 
 
@@ -606,128 +966,102 @@ class VoiceReceiver:
 # ==============================================================================
 
 class RecordingSession:
-    """
-    Encapsulates one continuous stay in a VC.
-    Created when the bot joins, destroyed when it leaves.
-    The monitor loop is the ONLY place that creates a RecordingSession.
-
-    Uses VoiceReceiver (SocketReader-based) instead of pycord's Sink system.
-    """
-
     def __init__(self, vc: discord.VoiceClient):
         self.vc          = vc
         self.guild       = vc.guild
-        self.receiver    = VoiceReceiver(vc)
         self.chunk_num   = 1
         self.chunk_start = time.time()
         self.date_str    = today_str()
+        # Create DAVE manager first so it can hook WS before receiver starts
+        self.dave        = DaveSessionManager(
+            vc,
+            user_id    = bot.user.id,
+            channel_id = vc.channel.id,
+        )
+        self.receiver    = None
 
-    # ------------------------------------------------------------------
-    # Save all audio from a finished receiver to disk, then merge per user.
-    # ------------------------------------------------------------------
     def _save_receiver(self, audio_data: dict, chunk_num: int):
         saved_folders = set()
-
         for user_id, buffer in audio_data.items():
             member    = self.guild.get_member(user_id)
             user_name = member.name if member else str(user_id)
             folder    = user_folder(user_id, user_name)
-
             try:
                 pcm_data = buffer.read_all()
                 if not pcm_data:
-                    print(f"   ⚠️  Empty audio for {user_name}, skipping.")
+                    print(f"   ⚠️ Empty audio for {user_name}, skipping.")
                     continue
-
-                # Convert PCM to MP3
                 mp3_data = pcm_to_mp3(pcm_data)
                 if not mp3_data:
-                    print(f"   ⚠️  MP3 conversion failed for {user_name}, saving raw PCM.")
+                    print(f"   ⚠️ MP3 conversion failed for {user_name}, saving raw PCM.")
                     chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}.pcm")
                     with open(chunk_file, 'wb') as f:
                         f.write(pcm_data)
                     continue
-
                 chunk_file = os.path.join(folder, f"{user_name}_part{chunk_num}.mp3")
                 with open(chunk_file, 'wb') as f:
                     f.write(mp3_data)
-                print(f"   ✅ Saved chunk {chunk_num} for {user_name}")
+                print(f"   ✅ Saved chunk {chunk_num} for {user_name} ({len(mp3_data)//1024}KB)")
                 saved_folders.add(folder)
-
             except Exception as e:
                 print(f"   ❌ Failed to save audio for {user_name}: {e}")
 
         for folder in saved_folders:
             merge_chunks(folder, self.date_str)
 
-    # ------------------------------------------------------------------
-    # Begin recording on the voice client.
-    # ------------------------------------------------------------------
     def start(self):
-        self.receiver    = VoiceReceiver(self.vc)
+        # Start DAVE manager first (hooks WS for MLS opcodes)
+        self.dave.start()
+        # Then start receiver
+        self.receiver    = VoiceReceiver(self.vc, self.dave)
         self.chunk_start = time.time()
         self.date_str    = today_str()
         self.receiver.start()
         print(f"▶️  Recording started — '{self.vc.channel.name}' chunk {self.chunk_num}")
 
-    # ------------------------------------------------------------------
-    # Rotate: stop current chunk, save, start next chunk immediately.
-    # ------------------------------------------------------------------
     async def rotate(self):
-        if not self.receiver.is_recording:
+        if not self.receiver or not self.receiver.is_recording:
             return
 
-        current_chunk    = self.chunk_num
-        current_audio    = self.receiver.audio_data
-        current_date     = self.date_str
+        current_chunk = self.chunk_num
+        current_audio = self.receiver.audio_data
         print(f"🔄 Rotating chunk {current_chunk} in '{self.guild.name}'...")
 
-        # Stop the current receiver
         self.receiver.stop()
-
-        # Start a new chunk immediately
         self.chunk_num  += 1
         self.chunk_start = time.time()
         self.date_str    = today_str()
 
         if self.vc.is_connected():
-            self.receiver = VoiceReceiver(self.vc)
+            self.receiver = VoiceReceiver(self.vc, self.dave)
             self.receiver.start()
             print(f"▶️  Chunk {self.chunk_num} started in '{self.vc.channel.name}'")
         else:
             set_state(self.guild.id, State.IDLE)
             return
 
-        # Save old chunk in background (CPU-bound ffmpeg work)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, self._save_receiver, current_audio, current_chunk
-        )
+        await loop.run_in_executor(None, self._save_receiver, current_audio, current_chunk)
         print(f"✅ Chunk {current_chunk} saved.")
 
-    # ------------------------------------------------------------------
-    # Stop: save chunk, disconnect, go IDLE.
-    # ------------------------------------------------------------------
     async def stop(self, reason: str = "manual"):
         print(f"⏹️  Stopping session ({reason}) in '{self.guild.name}'...")
         set_state(self.guild.id, State.SAVING)
 
-        if self.receiver.is_recording:
+        if self.receiver and self.receiver.is_recording:
             self.receiver.stop()
 
-        # Save remaining audio
-        audio_data = self.receiver.audio_data
+        self.dave.stop()
+
+        audio_data = self.receiver.audio_data if self.receiver else {}
         chunk_num  = self.chunk_num
         if audio_data:
             print(f"💾 Processing chunk {chunk_num} for '{self.guild.name}'...")
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self._save_receiver, audio_data, chunk_num
-            )
+            await loop.run_in_executor(None, self._save_receiver, audio_data, chunk_num)
             print(f"✅ Chunk {chunk_num} done.")
 
         set_state(self.guild.id, State.IDLE)
-
         await asyncio.sleep(1)
 
         if self.vc.is_connected():
@@ -740,7 +1074,6 @@ class RecordingSession:
         print(f"✅ Session ended in '{self.guild.name}'. Cooldown {LEAVE_COOLDOWN}s.")
 
 
-# Active sessions: guild_id -> RecordingSession
 active_sessions: dict = {}
 
 # ==============================================================================
@@ -784,31 +1117,25 @@ async def monitor():
         vc    = guild.voice_client
         now   = time.time()
 
-        # Expire cooldown
         if gid in guild_cooldown and now >= guild_cooldown[gid]:
             del guild_cooldown[gid]
 
-        # Saving: wait for save to finish
         if state == State.SAVING:
             continue
 
-        # --------------------------------------------------------------
-        # RECORDING
-        # --------------------------------------------------------------
         if state == State.RECORDING:
             session = active_sessions.get(gid)
-
-            # Silent disconnect
             if not vc or not vc.is_connected():
                 print(f"⚠️  Silent disconnect in '{guild.name}' — going IDLE.")
-                if session and session.receiver.is_recording:
+                if session and session.receiver and session.receiver.is_recording:
                     session.receiver.stop()
+                if session:
+                    session.dave.stop()
                 active_sessions.pop(gid, None)
                 set_state(gid, State.IDLE)
                 guild_cooldown[gid] = now + LEAVE_COOLDOWN
                 continue
 
-            # No more targets
             if not channel_has_target(vc.channel):
                 print(f"No targets left in '{vc.channel.name}' — leaving.")
                 active_sessions.pop(gid, None)
@@ -816,13 +1143,9 @@ async def monitor():
                     await session.stop(reason="no targets")
                 continue
 
-            # Chunk rotation
             if session and (now - session.chunk_start) >= CHUNK_SECONDS:
                 await session.rotate()
 
-        # --------------------------------------------------------------
-        # IDLE
-        # --------------------------------------------------------------
         elif state == State.IDLE:
             if gid in guild_cooldown:
                 continue
@@ -831,7 +1154,6 @@ async def monitor():
             if not target:
                 continue
 
-            # Clean up stale voice client
             if vc and vc.is_connected():
                 try:
                     await vc.disconnect(force=True)
@@ -858,17 +1180,14 @@ async def monitor():
 
 @bot.event
 async def on_ready():
-    print(f"\n🤖 Logged in as {bot.user}")
-    print(f"   Monitoring {len(bot.guilds)} server(s) every {CHECK_INTERVAL}s\n")
+    print(f"\n🤖 Logged in as {bot.user} (id={bot.user.id})")
+    print(f"   Monitoring {len(bot.guilds)} server(s) every {CHECK_INTERVAL}s")
+    print(f"   DAVE support: {'✅ enabled' if DAVE_AVAILABLE else '❌ disabled (install davey)'}\n")
     startup_cleanup()
     monitor.start()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """
-    Only handles the bot being forcibly kicked.
-    Ignored if state is IDLE (normal join handshake events).
-    """
     if member.id != bot.user.id:
         return
     if not (before.channel and not after.channel):
@@ -878,12 +1197,10 @@ async def on_voice_state_update(member, before, after):
     gid   = guild.id
     state = get_state(gid)
 
-    # Ignore disconnect events during IDLE — these are join handshake artifacts
     if state == State.IDLE:
         return
 
     print(f"⚠️  Bot disconnected from '{before.channel.name}' in '{guild.name}'")
-
     session = active_sessions.pop(gid, None)
 
     if session and state == State.RECORDING:
@@ -899,60 +1216,43 @@ async def on_voice_state_update(member, before, after):
 def _whitelisted(ctx) -> bool:
     return ctx.author.id in ALLOWED_USERS
 
-# --- !stop ---
-
 @bot.command()
 async def stop(ctx):
-    """Save current chunk and go idle. Bot rejoins when targets are available."""
     if not _whitelisted(ctx):
         await ctx.send("⛔ You are not allowed to use this command.")
         return
-
     gid   = ctx.guild.id
     state = get_state(gid)
-
     if state != State.RECORDING:
         await ctx.send("⚠️ I'm not currently recording.")
         return
-
     session = active_sessions.pop(gid, None)
     await ctx.send("⏹️ Saving chunk... I'll rejoin automatically when you're back.")
-
     if session:
         await session.stop(reason="!stop command")
     else:
         set_state(gid, State.IDLE)
 
-# --- !pause ---
-
 @bot.command()
 async def pause(ctx, minutes: int = None):
-    """Pause your own recording for N minutes. Usage: !pause 30"""
     if not _whitelisted(ctx):
         await ctx.send("⛔ You are not allowed to use this command.")
         return
     if not minutes or minutes <= 0:
-        await ctx.send("⚠️ Usage: `!pause <minutes>` — e.g. `!pause 30`")
+        await ctx.send("⚠️ Usage: `!pause <minutes>`")
         return
-
     user_id   = ctx.author.id
     user_name = "".join(c for c in ctx.author.name if c.isalnum())
-
     await _flush_user_audio(ctx.guild, user_id, user_name)
     pause_user(user_id, minutes)
-
     resume_at = datetime.fromtimestamp(user_paused_until[user_id]).strftime("%H:%M:%S")
     await ctx.send(
-        f"⏸️ **{ctx.author.display_name}** — paused for **{minutes}min**. "
+        f"⏸️ **{ctx.author.display_name}** paused for **{minutes}min**. "
         f"Resumes at **{resume_at}**. Use `!unpause` to resume early."
     )
-    print(f"⏸️  {ctx.author.name} paused for {minutes}min.")
-
-# --- !unpause / !continue ---
 
 @bot.command()
 async def unpause(ctx):
-    """Resume recording before the pause expires."""
     if not _whitelisted(ctx):
         await ctx.send("⛔ You are not allowed to use this command.")
         return
@@ -961,34 +1261,27 @@ async def unpause(ctx):
         return
     unpause_user(ctx.author.id)
     await ctx.send(f"▶️ **{ctx.author.display_name}** — recording resumed.")
-    print(f"▶️  {ctx.author.name} unpaused.")
 
 @bot.command(name="continue")
 async def cmd_continue(ctx):
-    """Alias for !unpause."""
     await unpause(ctx)
-
-# --- !whitelist / !allow / !unallow ---
 
 @bot.command()
 async def whitelist(ctx):
-    """Show the recording whitelist."""
     if not ALLOWED_USERS:
-        await ctx.send("📋 Whitelist is empty. Use `!allow <user_id>` to add someone.")
+        await ctx.send("📋 Whitelist is empty.")
     else:
         lines = "\n".join(f"• `{uid}`" for uid in ALLOWED_USERS)
         await ctx.send(f"📋 **Recording {len(ALLOWED_USERS)} user(s):**\n{lines}")
 
 @bot.command()
 async def allow(ctx, user_id: int):
-    """Add a user to the recording whitelist. Usage: !allow <user_id>"""
     ALLOWED_USERS.add(user_id)
     _save_whitelist()
     await ctx.send(f"✅ `{user_id}` added. ({len(ALLOWED_USERS)} tracked)")
 
 @bot.command()
 async def unallow(ctx, user_id: int):
-    """Remove a user from the recording whitelist. Usage: !unallow <user_id>"""
     ALLOWED_USERS.discard(user_id)
     _save_whitelist()
     msg = f"({len(ALLOWED_USERS)} remaining)" if ALLOWED_USERS else "Whitelist is now **empty**."
@@ -1007,11 +1300,27 @@ def _save_whitelist():
     with open(env_path, 'w') as f:
         f.writelines(lines)
 
-# --- !restart ---
+@bot.command()
+async def dave_status(ctx):
+    """Show DAVE session status for debugging."""
+    gid     = ctx.guild.id
+    session = active_sessions.get(gid)
+    if not session:
+        await ctx.send("⚠️ No active recording session.")
+        return
+    dm = session.dave
+    await ctx.send(
+        f"🔐 **DAVE Status**\n"
+        f"• davey available: `{DAVE_AVAILABLE}`\n"
+        f"• Session ready: `{dm.is_ready}`\n"
+        f"• Protocol version: `{dm._version}`\n"
+        f"• Ratchets: `{list(dm._ratchets.keys())}`\n"
+        f"• Pending transitions: `{list(dm._pending_transitions.keys())}`\n"
+        f"• WS hooked: `{dm._hooked}`"
+    )
 
 @bot.command()
 async def restart(ctx):
-    """Save recordings and restart the bot process."""
     if not _whitelisted(ctx):
         await ctx.send("⛔ You are not allowed to use this command.")
         return
@@ -1020,29 +1329,23 @@ async def restart(ctx):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # ==============================================================================
-# FLUSH HELPER  (used by !pause to preserve buffered audio)
+# FLUSH HELPER
 # ==============================================================================
 
 async def _flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
     session = active_sessions.get(guild.id)
-    if not session:
+    if not session or not session.receiver or not session.receiver.is_recording:
         return
-    vc = session.vc
-    if not vc or not vc.is_connected() or not session.receiver.is_recording:
-        return
-    receiver = session.receiver
-    if user_id not in receiver.audio_data:
+    if user_id not in session.receiver.audio_data:
         return
 
-    buffer = receiver.audio_data[user_id]
+    buffer = session.receiver.audio_data[user_id]
     try:
         pcm_data = buffer.read_all()
         if not pcm_data:
             return
-
         folder   = user_folder(user_id, user_name)
         mp3_data = pcm_to_mp3(pcm_data)
-
         if mp3_data:
             chunk_file = os.path.join(folder, f"{user_name}_part{session.chunk_num}_pre_pause.mp3")
             with open(chunk_file, 'wb') as f:
@@ -1051,15 +1354,10 @@ async def _flush_user_audio(guild: discord.Guild, user_id: int, user_name: str):
             chunk_file = os.path.join(folder, f"{user_name}_part{session.chunk_num}_pre_pause.pcm")
             with open(chunk_file, 'wb') as f:
                 f.write(pcm_data)
-
-        print(f"   💾 Pre-pause flush saved for {user_name}")
-
+        print(f"   💾 Pre-pause flush for {user_name}")
         merge_chunks(folder, today_str())
-
-        # Reset the user's buffer
         buffer.reset()
         session.chunk_num += 1
-
     except Exception as e:
         print(f"   ❌ Pre-pause flush failed for {user_name}: {e}")
 
@@ -1073,12 +1371,13 @@ async def _shutdown_all():
         vc = session.vc
         if vc and vc.is_connected():
             print(f"   Saving '{session.guild.name}'...")
-            if session.receiver.is_recording:
+            if session.receiver and session.receiver.is_recording:
                 session.receiver.stop()
                 audio_data = session.receiver.audio_data
                 if audio_data:
                     session._save_receiver(audio_data, session.chunk_num)
-                await asyncio.sleep(1)
+            session.dave.stop()
+            await asyncio.sleep(1)
             try:
                 await vc.disconnect(force=True)
             except Exception:
