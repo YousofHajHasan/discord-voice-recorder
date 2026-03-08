@@ -1,7 +1,7 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
-# Prevent timezone prompts from freezing the build, I don't know what is this.
-ENV DEBIAN_FRONTEND=noninteractive 
+# Prevent timezone prompts from freezing the build
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install build tools, FFmpeg, and required libraries
 RUN apt-get update && \
