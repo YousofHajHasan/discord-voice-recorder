@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install build tools, FFmpeg, and required libraries
 RUN apt-get update && \
-    apt-get install -y g++ wget ffmpeg libopus0 libssl-dev zlib1g-dev && \
+    apt-get install -y --fix-missing g++ wget ffmpeg libopus0 libssl-dev zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
