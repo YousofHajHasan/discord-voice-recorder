@@ -145,7 +145,7 @@ void append_mp3(const std::string& daily_mp3, const std::string& chunk_mp3,
  
     std::string temp_out = folder_path + "/temp_combined.mp3";
     std::string cmd = "ffmpeg -y -f concat -safe 0 -i \"" + filelist
-                      + "\" -c copy \"" + temp_out + "\" > /dev/null 2>&1";
+                  + "\" -c copy \"" + temp_out + "\"";
     std::cout << "[APPEND_MP3] Running ffmpeg concat...\n";
     int rc = std::system(cmd.c_str());
     std::cout << "[APPEND_MP3] ffmpeg exited with code: " << rc << "\n";
@@ -446,20 +446,28 @@ int main() {
     bot.on_voice_receive([](const dpp::voice_receive_t& event) {
         if (event.user_id == 0) return;
         if (!ALLOWED_USERS.count(event.user_id)) return;
- 
+
         dpp::snowflake guild_id = event.voice_client->server_id;
- 
+
         if (!udp_hole_punched[guild_id]) {
             std::cout << "[VOICE_RECV] First real packet received — UDP open for guild " << guild_id << "\n";
             udp_hole_punched[guild_id] = true;
         }
- 
+
         std::lock_guard<std::mutex> lock(bot_mutex);
         auto& buf = audio_buffers[event.user_id];
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(event.audio_data.data());
         buf.insert(buf.end(), ptr, ptr + event.audio_data.size());
+
+        // Log buffer size every 1000 packets to avoid log spam
+        static std::map<dpp::snowflake, int> packet_counts;
+        if (++packet_counts[event.user_id] % 1000 == 0) {
+            std::cout << "[VOICE_RECV] User " << event.user_id
+                    << " — packets: " << packet_counts[event.user_id]
+                    << " — buffer: " << buf.size() << " bytes\n";
+        }
     });
- 
+
     std::cout << "[MAIN] Starting bot event loop\n";
     bot.start(dpp::st_wait);
  
