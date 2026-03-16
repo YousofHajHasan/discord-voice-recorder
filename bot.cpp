@@ -14,6 +14,7 @@
 #include <functional>
 #include <ctime>
 #include <unordered_set>
+#include <unordered_map>
 #include <sys/stat.h>
 
 // ---------------------------------------------------------------------------
@@ -21,7 +22,7 @@
 // ---------------------------------------------------------------------------
 std::string DISCORD_TOKEN;
 std::string BASE_PATH = "recordings/";
-int CHUNK_TIME = 60;
+int CHUNK_TIME = 300; // Defaulting to 300 as per your logs
 std::unordered_set<dpp::snowflake> ALLOWED_CHANNELS;
 std::unordered_set<dpp::snowflake> ALLOWED_USERS;
 
@@ -32,7 +33,15 @@ std::map<dpp::snowflake, std::vector<uint8_t>> audio_buffers;
 std::map<dpp::snowflake, bool>                 udp_hole_punched;
 std::map<dpp::snowflake, bool>                 guild_transitioning;
 std::map<dpp::snowflake, std::shared_ptr<std::atomic<bool>>> punch_active;
-std::mutex                                     bot_mutex;
+
+// New global trackers for silence injection and logging
+std::map<dpp::snowflake, std::chrono::time_point<std::chrono::steady_clock>> last_packet_time;
+std::map<dpp::snowflake, int> packet_counts;
+std::mutex bot_mutex;
+
+// Thread-safe map for Voice States: guild_id -> (user_id -> channel_id)
+std::map<dpp::snowflake, std::map<dpp::snowflake, dpp::snowflake>> safe_voice_states;
+std::mutex state_mutex;
 
 // ---------------------------------------------------------------------------
 // Dedicated FFmpeg worker thread
@@ -135,7 +144,7 @@ void append_mp3(const std::string& daily_mp3, const std::string& chunk_mp3,
         std::rename(temp_out.c_str(), daily_mp3.c_str());
         std::cout << "[APPEND_MP3] Appended to daily file: " << daily_mp3 << "\n";
     } else {
-        std::cout << "[APPEND_MP3] ERROR — ffmpeg concat failed (code " << rc << ") — chunk preserved: " << chunk_mp3 << "\n";
+        std::cout << "[APPEND_MP3] ERROR — concat failed (code " << rc << ") — chunk preserved: " << chunk_mp3 << "\n";
         std::remove(filelist.c_str());
         return;
     }
@@ -153,6 +162,11 @@ void save_and_clear_buffers(dpp::cluster& bot) {
         std::lock_guard<std::mutex> lock(bot_mutex);
         if (audio_buffers.empty()) return;
         local_buffers = std::move(audio_buffers);
+        audio_buffers.clear(); 
+        
+        // Reset tracking to prevent massive silence injections between chunks
+        last_packet_time.clear();
+        packet_counts.clear(); 
     }
 
     auto now_c = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -210,81 +224,84 @@ void save_and_clear_buffers(dpp::cluster& bot) {
 }
 
 // ---------------------------------------------------------------------------
-// Verify bot placement
+// Verify bot placement (Thread-Safe)
 // ---------------------------------------------------------------------------
 void verify_bot_placement(dpp::cluster& bot) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    
     for (const auto& channel_id : ALLOWED_CHANNELS) {
         dpp::channel* c = dpp::find_channel(channel_id);
         if (!c) continue;
-        dpp::guild* g = dpp::find_guild(c->guild_id);
-        if (!g || guild_transitioning[g->id]) continue;
+        dpp::snowflake gid = c->guild_id;
+        if (guild_transitioning[gid]) continue;
 
-        auto bot_state = g->voice_members.find(bot.me.id);
-        if (bot_state == g->voice_members.end()) continue;
-
-        dpp::snowflake bot_channel = bot_state->second.channel_id;
-        if (bot_channel == 0) continue;
+        dpp::snowflake bot_channel = safe_voice_states[gid][bot.me.id];
+        if (bot_channel == 0) continue; 
 
         bool in_allowed = ALLOWED_CHANNELS.count(bot_channel) > 0;
 
         int allowed_present = 0;
-        for (const auto& [u_id, state] : g->voice_members)
-            if (state.channel_id == bot_channel && ALLOWED_USERS.count(u_id))
+        for (const auto& [u_id, c_id] : safe_voice_states[gid]) {
+            if (c_id == bot_channel && ALLOWED_USERS.count(u_id)) {
                 allowed_present++;
+            }
+        }
 
-        dpp::discord_client* shard = bot.get_shard(g->shard_id);
+        dpp::discord_client* shard = bot.get_shard(dpp::find_guild(gid)->shard_id);
 
         if (!in_allowed) {
             std::cout << "[VERIFY] Bot in non-allowed channel — disconnecting\n";
-            guild_transitioning[g->id] = true;
+            guild_transitioning[gid] = true;
             save_and_clear_buffers(bot);
-            if (shard) shard->disconnect_voice(g->id);
+            if (shard) shard->disconnect_voice(gid);
         } else if (allowed_present == 0) {
             std::cout << "[VERIFY] Bot alone in channel — disconnecting\n";
-            guild_transitioning[g->id] = true;
+            guild_transitioning[gid] = true;
             save_and_clear_buffers(bot);
-            if (shard) shard->disconnect_voice(g->id);
+            if (shard) shard->disconnect_voice(gid);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Evaluate VCs
+// Evaluate VCs (Thread-Safe)
 // ---------------------------------------------------------------------------
 void evaluate_vcs(dpp::cluster& bot) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    
     for (const auto& channel_id : ALLOWED_CHANNELS) {
         dpp::channel* c = dpp::find_channel(channel_id);
         if (!c) continue;
-        dpp::guild* g = dpp::find_guild(c->guild_id);
-        if (!g || guild_transitioning[g->id]) continue;
+        dpp::snowflake gid = c->guild_id;
+        if (guild_transitioning[gid]) continue;
 
         int allowed_present = 0;
-        for (const auto& [u_id, state] : g->voice_members)
-            if (state.channel_id == channel_id && ALLOWED_USERS.count(u_id))
+        for (const auto& [u_id, c_id] : safe_voice_states[gid]) {
+            if (c_id == channel_id && ALLOWED_USERS.count(u_id)) {
                 allowed_present++;
+            }
+        }
 
-        auto bot_state   = g->voice_members.find(bot.me.id);
-        bool bot_in_this = (bot_state != g->voice_members.end()
-                            && bot_state->second.channel_id == channel_id);
-        bool bot_in_any  = (bot_state != g->voice_members.end()
-                            && bot_state->second.channel_id != 0);
+        dpp::snowflake bot_c_id = safe_voice_states[gid][bot.me.id];
+        bool bot_in_this = (bot_c_id == channel_id);
+        bool bot_in_any  = (bot_c_id != 0);
 
-        dpp::discord_client* shard = bot.get_shard(g->shard_id);
+        dpp::discord_client* shard = bot.get_shard(dpp::find_guild(gid)->shard_id);
 
         if (allowed_present > 0 && !bot_in_this && !bot_in_any) {
             std::cout << "[EVAL] Joining channel " << channel_id << "\n";
-            guild_transitioning[g->id] = true;
-            udp_hole_punched[g->id]    = false;
-            punch_active[g->id] = std::make_shared<std::atomic<bool>>(true);
-            if (shard) shard->connect_voice(g->id, channel_id);
+            guild_transitioning[gid] = true;
+            udp_hole_punched[gid]    = false;
+            punch_active[gid] = std::make_shared<std::atomic<bool>>(true);
+            if (shard) shard->connect_voice(gid, channel_id);
         }
         else if (allowed_present == 0 && bot_in_this) {
             std::cout << "[EVAL] No allowed users left — disconnecting\n";
-            guild_transitioning[g->id] = true;
-            if (punch_active.count(g->id) && punch_active[g->id])
-                punch_active[g->id]->store(false);
+            guild_transitioning[gid] = true;
+            if (punch_active.count(gid) && punch_active[gid])
+                punch_active[gid]->store(false);
             save_and_clear_buffers(bot);
-            if (shard) shard->disconnect_voice(g->id);
+            if (shard) shard->disconnect_voice(gid);
         }
     }
 }
@@ -302,7 +319,6 @@ int main() {
     }
 
     std::thread worker(ffmpeg_worker);
-
     dpp::cluster bot(DISCORD_TOKEN, dpp::i_all_intents);
 
     bot.on_log([](const dpp::log_t& event) {
@@ -327,8 +343,19 @@ int main() {
     });
 
     bot.on_voice_state_update([&bot](const dpp::voice_state_update_t& event) {
+        dpp::snowflake gid = event.state.guild_id;
+
+        // Safely update our isolated state map
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            if (event.state.channel_id == 0) {
+                safe_voice_states[gid].erase(event.state.user_id);
+            } else {
+                safe_voice_states[gid][event.state.user_id] = event.state.channel_id;
+            }
+        }
+
         if (event.state.user_id == bot.me.id) {
-            dpp::snowflake gid = event.state.guild_id;
             if (guild_transitioning[gid]) {
                 std::cout << "[VOICE_STATE] Bot transition confirmed for guild " << gid << "\n";
                 guild_transitioning[gid] = false;
@@ -380,16 +407,35 @@ int main() {
                 punch_active[guild_id]->store(false);
         }
 
+        auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(bot_mutex);
         auto& buf = audio_buffers[event.user_id];
+        
+        // --- PCM Silence Injection ---
+        if (last_packet_time.count(event.user_id) > 0) {
+            auto diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_packet_time[event.user_id]).count();
+            
+            // Discord sends 20ms frames. If gap is > 40ms, inject silence.
+            int64_t silence_ms = diff_ms - 20; 
+            if (silence_ms > 0) {
+                // 48000 Hz * 2 channels * 2 bytes = 192 bytes per ms
+                size_t silence_bytes = silence_ms * 192;
+                
+                // Align to 4-byte boundaries (Stereo 16-bit) to prevent audio tearing
+                silence_bytes = (silence_bytes / 4) * 4; 
+                buf.insert(buf.end(), silence_bytes, 0);
+            }
+        }
+        last_packet_time[event.user_id] = now;
+
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(event.audio_data.data());
         buf.insert(buf.end(), ptr, ptr + event.audio_data.size());
 
-        static std::map<dpp::snowflake, int> packet_counts;
-        if (++packet_counts[event.user_id] % 1000 == 0)
+        if (++packet_counts[event.user_id] % 1000 == 0) {
             std::cout << "[VOICE_RECV] User " << event.user_id
                       << " — packets: " << packet_counts[event.user_id]
                       << " — buffer: " << buf.size() << " bytes\n";
+        }
     });
 
     bot.on_voice_client_disconnect([&bot](const dpp::voice_client_disconnect_t& event) {

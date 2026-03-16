@@ -1,4 +1,11 @@
 """
+
+### --- ### --- ### --- ### --- ### --- ### --- ###
+                    DEPRECATED
+### --- ### --- ### --- ### --- ### --- ### --- ###
+
+The used code right now is bot.cpp, which have the support for DAVE.
+
 Discord Voice Recorder
 ======================
 Records whitelisted users from Discord voice channels to per-user MP3 files.
