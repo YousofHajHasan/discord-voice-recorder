@@ -16,13 +16,15 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <sys/stat.h>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 std::string DISCORD_TOKEN;
 std::string BASE_PATH = "recordings/";
-int CHUNK_TIME = 300; // Defaulting to 300 as per your logs
+int CHUNK_TIME = 300;
+const size_t MAX_BUFFER_SIZE = 300 * 1024 * 1024; // 300 MB 
 std::unordered_set<dpp::snowflake> ALLOWED_CHANNELS;
 std::unordered_set<dpp::snowflake> ALLOWED_USERS;
 
@@ -120,36 +122,19 @@ void append_mp3(const std::string& daily_mp3, const std::string& chunk_mp3,
         return;
     }
 
-    char abs_daily[PATH_MAX];
-    char abs_chunk[PATH_MAX];
-    if (!realpath(daily_mp3.c_str(), abs_daily) ||
-        !realpath(chunk_mp3.c_str(), abs_chunk)) {
-        std::cout << "[APPEND_MP3] ERROR — could not resolve absolute paths\n";
-        return;
-    }
-
-    std::string filelist = folder_path + "/filelist.txt";
-    {
-        std::ofstream fl(filelist);
-        fl << "file '" << abs_daily << "'\n";
-        fl << "file '" << abs_chunk  << "'\n";
-    }
-
-    std::string temp_out = folder_path + "/temp_combined.mp3";
-    std::string cmd = "ffmpeg -y -f concat -safe 0 -i \"" + filelist
-                      + "\" -c copy \"" + temp_out + "\" > /dev/null 2>&1";
-    int rc = std::system(cmd.c_str());
-
-    if (rc == 0 && stat(temp_out.c_str(), &st) == 0 && st.st_size > 0) {
-        std::rename(temp_out.c_str(), daily_mp3.c_str());
+    // Binary append
+    std::ifstream src(chunk_mp3, std::ios::binary);
+    std::ofstream dst(daily_mp3, std::ios::binary | std::ios::app);
+    
+    if (src && dst) {
+        dst << src.rdbuf();
         std::cout << "[APPEND_MP3] Appended to daily file: " << daily_mp3 << "\n";
     } else {
-        std::cout << "[APPEND_MP3] ERROR — concat failed (code " << rc << ") — chunk preserved: " << chunk_mp3 << "\n";
-        std::remove(filelist.c_str());
-        return;
+        std::cout << "[APPEND_MP3] ERROR opening files for binary append\n";
     }
-
-    std::remove(filelist.c_str());
+    
+    src.close();
+    dst.close();
     std::remove(chunk_mp3.c_str());
 }
 
@@ -209,13 +194,19 @@ void save_and_clear_buffers(dpp::cluster& bot) {
             std::string enc = "ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"" + pcm_path
                               + "\" -b:a 192k \"" + chunk_mp3 + "\" > /dev/null 2>&1";
             int rc = std::system(enc.c_str());
-            std::remove(pcm_path.c_str());
 
             struct stat st;
-            if (stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
-                std::cout << "[FFMPEG_JOB] ERROR — encode failed for user " << user_id << "\n";
-                return;
+            if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
+                std::cout << "[FFMPEG_JOB] Encode failed for user " << user_id << ", retrying...\n";
+                rc = std::system(enc.c_str());
+                if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
+                    std::cout << "[FFMPEG_JOB] Retry failed. Saving raw PCM as recovery.\n";
+                    std::string recovery_pcm = folder_path + "/recovery_" + std::to_string(std::time(nullptr)) + ".pcm";
+                    std::rename(pcm_path.c_str(), recovery_pcm.c_str());
+                    return;
+                }
             }
+            std::remove(pcm_path.c_str());
 
             std::cout << "[FFMPEG_JOB] Encoded " << st.st_size << " bytes for user " << user_id << "\n";
             append_mp3(daily_mp3, chunk_mp3, folder_path);
@@ -394,9 +385,12 @@ int main() {
         }).detach();
     });
 
-    bot.on_voice_receive([](const dpp::voice_receive_t& event) {
+    bot.on_voice_receive([&bot](const dpp::voice_receive_t& event) {
         if (event.user_id == 0) return;
         if (!ALLOWED_USERS.count(event.user_id)) return;
+
+        bool is_silence = std::all_of(event.audio_data.begin(), event.audio_data.end(), [](uint8_t b) { return b == 0; });
+        if (is_silence) return; // Drop silence packets immediately
 
         dpp::snowflake guild_id = event.voice_client->server_id;
 
@@ -407,34 +401,76 @@ int main() {
                 punch_active[guild_id]->store(false);
         }
 
-        auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(bot_mutex);
-        auto& buf = audio_buffers[event.user_id];
-        
-        // --- PCM Silence Injection ---
-        if (last_packet_time.count(event.user_id) > 0) {
-            auto diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_packet_time[event.user_id]).count();
-            
-            // Discord sends 20ms frames. If gap is > 40ms, inject silence.
-            int64_t silence_ms = diff_ms - 20; 
-            if (silence_ms > 0) {
-                // 48000 Hz * 2 channels * 2 bytes = 192 bytes per ms
-                size_t silence_bytes = silence_ms * 192;
-                
-                // Align to 4-byte boundaries (Stereo 16-bit) to prevent audio tearing
-                silence_bytes = (silence_bytes / 4) * 4; 
-                buf.insert(buf.end(), silence_bytes, 0);
+        std::vector<uint8_t> buffer_to_save;
+        {
+            std::lock_guard<std::mutex> lock(bot_mutex);
+            auto& buf = audio_buffers[event.user_id];
+
+            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(event.audio_data.data());
+            buf.insert(buf.end(), ptr, ptr + event.audio_data.size());
+
+            if (++packet_counts[event.user_id] % 1000 == 0) {
+                std::cout << "[VOICE_RECV] User " << event.user_id
+                          << " — buffer: " << buf.size() << " bytes\n";
+            }
+
+            if (buf.size() >= MAX_BUFFER_SIZE) {
+                std::cout << "[VOICE_RECV] User " << event.user_id << " exceeded max buffer size (" << buf.size() << "). Forcing save.\n";
+                buffer_to_save = std::move(buf);
+                audio_buffers[event.user_id].clear();
+                packet_counts[event.user_id] = 0;
             }
         }
-        last_packet_time[event.user_id] = now;
 
-        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(event.audio_data.data());
-        buf.insert(buf.end(), ptr, ptr + event.audio_data.size());
+        // Process forced save outside the mutex lock
+        if (!buffer_to_save.empty()) {
+            auto now_c = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            char date_str[32];
+            std::strftime(date_str, sizeof(date_str), "%Y-%m-%d", std::localtime(&now_c));
+            std::string current_date(date_str);
 
-        if (++packet_counts[event.user_id] % 1000 == 0) {
-            std::cout << "[VOICE_RECV] User " << event.user_id
-                      << " — packets: " << packet_counts[event.user_id]
-                      << " — buffer: " << buf.size() << " bytes\n";
+            std::string folder_path = BASE_PATH + std::to_string(event.user_id);
+            std::string daily_mp3   = folder_path + "/" + current_date + ".mp3";
+            dpp::user* u = dpp::find_user(event.user_id);
+            std::string username = u ? u->username : "unknown";
+
+            uint64_t u_id = event.user_id;
+
+            enqueue_ffmpeg([buf = std::move(buffer_to_save), folder_path, daily_mp3, username, u_id]() mutable {
+                ensure_directory_exists(folder_path);
+
+                {
+                    std::ofstream meta(folder_path + "/username.txt", std::ios::trunc);
+                    meta << username << "\n";
+                }
+
+                std::string pcm_path  = folder_path + "/temp_chunk.pcm";
+                std::string chunk_mp3 = folder_path + "/temp_chunk.mp3";
+
+                {
+                    std::ofstream f(pcm_path, std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+                }
+
+                std::string enc = "ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"" + pcm_path
+                                  + "\" -b:a 192k \"" + chunk_mp3 + "\" > /dev/null 2>&1";
+                int rc = std::system(enc.c_str());
+
+                struct stat st;
+                if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
+                    std::cout << "[FFMPEG_JOB] Encode failed for user " << u_id << ", retrying...\n";
+                    rc = std::system(enc.c_str());
+                    if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
+                        std::cout << "[FFMPEG_JOB] Retry failed. Saving raw PCM as recovery.\n";
+                        std::string recovery_pcm = folder_path + "/recovery_" + std::to_string(std::time(nullptr)) + ".pcm";
+                        std::rename(pcm_path.c_str(), recovery_pcm.c_str());
+                        return;
+                    }
+                }
+                std::remove(pcm_path.c_str());
+                std::cout << "[FFMPEG_JOB] Encoded " << st.st_size << " bytes for user " << u_id << "\n";
+                append_mp3(daily_mp3, chunk_mp3, folder_path);
+            });
         }
     });
 
