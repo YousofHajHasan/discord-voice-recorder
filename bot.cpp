@@ -39,7 +39,7 @@ const int    DISCORD_PACKET_BYTES = DISCORD_FRAME_SIZE * DISCORD_CHANNELS * 2;
 // Silence injection: inject exactly this many seconds of silence when a gap
 // of >= GAP_THRESHOLD seconds is detected between voice packets.
 // Capped to avoid runaway buffer growth during long pauses.
-const double GAP_THRESHOLD     = 1.50; // seconds — gap that triggers injection
+const double GAP_THRESHOLD     = 1.00; // seconds — gap that triggers injection
 const double SILENCE_INJECT_S  = 0.50; // seconds of silence to inject (fixed)
 
 std::unordered_set<dpp::snowflake> ALLOWED_CHANNELS;
