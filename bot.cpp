@@ -22,9 +22,26 @@
 // Configuration
 // ---------------------------------------------------------------------------
 std::string DISCORD_TOKEN;
-std::string BASE_PATH = "recordings/";
-int CHUNK_TIME = 300;
-const size_t MAX_BUFFER_SIZE = 300 * 1024 * 1024; // 300 MB 
+std::string BASE_PATH       = "recordings/";
+int         CHUNK_TIME      = 300;
+const size_t MAX_BUFFER_SIZE = 300 * 1024 * 1024; // 300 MB
+
+// Audio settings (16kHz mono is the standard for AI/ASR pipelines)
+const int    RECORD_SAMPLE_RATE = 16000;
+const int    RECORD_CHANNELS    = 1;
+// Discord always delivers 48kHz stereo s16le — each packet is 960 frames
+const int    DISCORD_SAMPLE_RATE = 48000;
+const int    DISCORD_CHANNELS    = 2;
+const int    DISCORD_FRAME_SIZE  = 960; // samples per channel per packet
+// Bytes per Discord packet: 960 frames * 2 ch * 2 bytes = 3840
+const int    DISCORD_PACKET_BYTES = DISCORD_FRAME_SIZE * DISCORD_CHANNELS * 2;
+
+// Silence injection: inject exactly this many seconds of silence when a gap
+// of >= GAP_THRESHOLD seconds is detected between voice packets.
+// Capped to avoid runaway buffer growth during long pauses.
+const double GAP_THRESHOLD     = 0.50; // seconds — gap that triggers injection
+const double SILENCE_INJECT_S  = 0.50; // seconds of silence to inject (fixed)
+
 std::unordered_set<dpp::snowflake> ALLOWED_CHANNELS;
 std::unordered_set<dpp::snowflake> ALLOWED_USERS;
 
@@ -36,12 +53,11 @@ std::map<dpp::snowflake, bool>                 udp_hole_punched;
 std::map<dpp::snowflake, bool>                 guild_transitioning;
 std::map<dpp::snowflake, std::shared_ptr<std::atomic<bool>>> punch_active;
 
-// New global trackers for silence injection and logging
 std::map<dpp::snowflake, std::chrono::time_point<std::chrono::steady_clock>> last_packet_time;
-std::map<dpp::snowflake, int> packet_counts;
+std::map<dpp::snowflake, bool>  silence_injected; // track if silence already injected for this gap
+std::map<dpp::snowflake, int>   packet_counts;
 std::mutex bot_mutex;
 
-// Thread-safe map for Voice States: guild_id -> (user_id -> channel_id)
 std::map<dpp::snowflake, std::map<dpp::snowflake, dpp::snowflake>> safe_voice_states;
 std::mutex state_mutex;
 
@@ -111,7 +127,45 @@ void ensure_directory_exists(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
-// Reliable MP3 append
+// Generate silence bytes for the RECORD format (16kHz mono s16le)
+// Fixed duration — never proportional to gap length to prevent buffer bloat.
+// ---------------------------------------------------------------------------
+std::vector<uint8_t> make_silence_bytes(double seconds = SILENCE_INJECT_S) {
+    size_t num_samples = static_cast<size_t>(seconds * RECORD_SAMPLE_RATE * RECORD_CHANNELS);
+    return std::vector<uint8_t>(num_samples * 2, 0); // 2 bytes per s16le sample
+}
+
+// ---------------------------------------------------------------------------
+// Downsample Discord 48kHz stereo → 16kHz mono (s16le)
+//
+// Simple approach: average stereo channels first, then pick every 3rd sample
+// (48000 / 16000 = 3). This is a basic decimation — good enough for voice.
+// For production you'd use a proper polyphase FIR, but this avoids dependencies.
+// ---------------------------------------------------------------------------
+std::vector<uint8_t> downsample_discord_packet(const uint8_t* data, size_t size) {
+    // Input: interleaved s16le stereo at 48kHz
+    // Output: mono s16le at 16kHz
+    const int16_t* src    = reinterpret_cast<const int16_t*>(data);
+    size_t         frames = size / (DISCORD_CHANNELS * sizeof(int16_t)); // stereo frames
+    const int      ratio  = DISCORD_SAMPLE_RATE / RECORD_SAMPLE_RATE;   // = 3
+
+    std::vector<uint8_t> out;
+    out.reserve((frames / ratio) * sizeof(int16_t));
+
+    for (size_t i = 0; i < frames; i += ratio) {
+        // Average left and right channels for this frame
+        int32_t mono = (static_cast<int32_t>(src[i * DISCORD_CHANNELS])
+                      + static_cast<int32_t>(src[i * DISCORD_CHANNELS + 1])) / 2;
+        int16_t sample = static_cast<int16_t>(mono);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&sample);
+        out.push_back(bytes[0]);
+        out.push_back(bytes[1]);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Reliable MP3 append — binary join of two MP3 files
 // ---------------------------------------------------------------------------
 void append_mp3(const std::string& daily_mp3, const std::string& chunk_mp3,
                 const std::string& folder_path) {
@@ -122,24 +176,42 @@ void append_mp3(const std::string& daily_mp3, const std::string& chunk_mp3,
         return;
     }
 
-    // Binary append
     std::ifstream src(chunk_mp3, std::ios::binary);
     std::ofstream dst(daily_mp3, std::ios::binary | std::ios::app);
-    
+
     if (src && dst) {
         dst << src.rdbuf();
         std::cout << "[APPEND_MP3] Appended to daily file: " << daily_mp3 << "\n";
     } else {
         std::cout << "[APPEND_MP3] ERROR opening files for binary append\n";
     }
-    
+
     src.close();
     dst.close();
     std::remove(chunk_mp3.c_str());
 }
 
 // ---------------------------------------------------------------------------
-// Save buffers
+// Build ffmpeg encode command
+// Input:  raw s16le PCM at RECORD_SAMPLE_RATE / RECORD_CHANNELS
+// Output: 128k MP3 (voice quality — 192k is overkill for 16kHz mono)
+// -af loudnorm: normalizes loudness to -16 LUFS, true peak ceiling -1.5 dBFS
+//              This prevents inter-chunk clipping when files are appended.
+// ---------------------------------------------------------------------------
+std::string build_ffmpeg_cmd(const std::string& pcm_path, const std::string& mp3_path) {
+    return "ffmpeg -y"
+           " -f s16le"
+           " -ar " + std::to_string(RECORD_SAMPLE_RATE) +
+           " -ac " + std::to_string(RECORD_CHANNELS) +
+           " -i \"" + pcm_path + "\""
+           " -af loudnorm=I=-16:TP=-1.5:LRA=11"
+           " -b:a 128k"
+           " \"" + mp3_path + "\""
+           " > /dev/null 2>&1";
+}
+
+// ---------------------------------------------------------------------------
+// Save and clear all buffers (called by timer or on overflow)
 // ---------------------------------------------------------------------------
 void save_and_clear_buffers(dpp::cluster& bot) {
     std::map<dpp::snowflake, std::vector<uint8_t>> local_buffers;
@@ -147,15 +219,17 @@ void save_and_clear_buffers(dpp::cluster& bot) {
         std::lock_guard<std::mutex> lock(bot_mutex);
         if (audio_buffers.empty()) return;
         local_buffers = std::move(audio_buffers);
-        audio_buffers.clear(); 
-        
-        // Reset tracking to prevent massive silence injections between chunks
+        audio_buffers.clear();
+
+        // Reset gap tracking so the next chunk doesn't inject silence
+        // at the start based on the old last_packet_time
         last_packet_time.clear();
-        packet_counts.clear(); 
+        silence_injected.clear();
+        packet_counts.clear();
     }
 
-    auto now_c = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    char date_str[32];
+    auto   now_c = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    char   date_str[32];
     std::strftime(date_str, sizeof(date_str), "%Y-%m-%d", std::localtime(&now_c));
     std::string current_date(date_str);
 
@@ -164,13 +238,15 @@ void save_and_clear_buffers(dpp::cluster& bot) {
     for (auto& [user_id, buffer] : local_buffers) {
         if (buffer.empty()) continue;
 
-        std::cout << "[SAVE] User " << user_id << " — " << buffer.size() << " bytes\n";
+        std::cout << "[SAVE] User " << user_id
+                  << " — " << buffer.size() << " bytes ("
+                  << (buffer.size() / 1024 / 1024) << " MB)\n";
 
         std::string folder_path = BASE_PATH + std::to_string(user_id);
         std::string daily_mp3   = folder_path + "/" + current_date + ".mp3";
 
         std::string username = "unknown";
-        dpp::user* u = dpp::find_user(user_id);
+        dpp::user*  u        = dpp::find_user(user_id);
         if (u) username = u->username;
 
         enqueue_ffmpeg([buf = std::move(buffer),
@@ -191,8 +267,7 @@ void save_and_clear_buffers(dpp::cluster& bot) {
                 f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
             }
 
-            std::string enc = "ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"" + pcm_path
-                              + "\" -b:a 192k \"" + chunk_mp3 + "\" > /dev/null 2>&1";
+            std::string enc = build_ffmpeg_cmd(pcm_path, chunk_mp3);
             int rc = std::system(enc.c_str());
 
             struct stat st;
@@ -201,14 +276,16 @@ void save_and_clear_buffers(dpp::cluster& bot) {
                 rc = std::system(enc.c_str());
                 if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
                     std::cout << "[FFMPEG_JOB] Retry failed. Saving raw PCM as recovery.\n";
-                    std::string recovery_pcm = folder_path + "/recovery_" + std::to_string(std::time(nullptr)) + ".pcm";
-                    std::rename(pcm_path.c_str(), recovery_pcm.c_str());
+                    std::string recovery = folder_path + "/recovery_"
+                                         + std::to_string(std::time(nullptr)) + ".pcm";
+                    std::rename(pcm_path.c_str(), recovery.c_str());
                     return;
                 }
             }
             std::remove(pcm_path.c_str());
 
-            std::cout << "[FFMPEG_JOB] Encoded " << st.st_size << " bytes for user " << user_id << "\n";
+            std::cout << "[FFMPEG_JOB] Encoded " << st.st_size
+                      << " bytes for user " << user_id << "\n";
             append_mp3(daily_mp3, chunk_mp3, folder_path);
         });
     }
@@ -219,7 +296,7 @@ void save_and_clear_buffers(dpp::cluster& bot) {
 // ---------------------------------------------------------------------------
 void verify_bot_placement(dpp::cluster& bot) {
     std::lock_guard<std::mutex> lock(state_mutex);
-    
+
     for (const auto& channel_id : ALLOWED_CHANNELS) {
         dpp::channel* c = dpp::find_channel(channel_id);
         if (!c) continue;
@@ -227,15 +304,14 @@ void verify_bot_placement(dpp::cluster& bot) {
         if (guild_transitioning[gid]) continue;
 
         dpp::snowflake bot_channel = safe_voice_states[gid][bot.me.id];
-        if (bot_channel == 0) continue; 
+        if (bot_channel == 0) continue;
 
         bool in_allowed = ALLOWED_CHANNELS.count(bot_channel) > 0;
 
         int allowed_present = 0;
         for (const auto& [u_id, c_id] : safe_voice_states[gid]) {
-            if (c_id == bot_channel && ALLOWED_USERS.count(u_id)) {
+            if (c_id == bot_channel && ALLOWED_USERS.count(u_id))
                 allowed_present++;
-            }
         }
 
         dpp::discord_client* shard = bot.get_shard(dpp::find_guild(gid)->shard_id);
@@ -259,7 +335,7 @@ void verify_bot_placement(dpp::cluster& bot) {
 // ---------------------------------------------------------------------------
 void evaluate_vcs(dpp::cluster& bot) {
     std::lock_guard<std::mutex> lock(state_mutex);
-    
+
     for (const auto& channel_id : ALLOWED_CHANNELS) {
         dpp::channel* c = dpp::find_channel(channel_id);
         if (!c) continue;
@@ -268,25 +344,23 @@ void evaluate_vcs(dpp::cluster& bot) {
 
         int allowed_present = 0;
         for (const auto& [u_id, c_id] : safe_voice_states[gid]) {
-            if (c_id == channel_id && ALLOWED_USERS.count(u_id)) {
+            if (c_id == channel_id && ALLOWED_USERS.count(u_id))
                 allowed_present++;
-            }
         }
 
-        dpp::snowflake bot_c_id = safe_voice_states[gid][bot.me.id];
-        bool bot_in_this = (bot_c_id == channel_id);
-        bool bot_in_any  = (bot_c_id != 0);
+        dpp::snowflake bot_c_id  = safe_voice_states[gid][bot.me.id];
+        bool           bot_here  = (bot_c_id == channel_id);
+        bool           bot_any   = (bot_c_id != 0);
 
         dpp::discord_client* shard = bot.get_shard(dpp::find_guild(gid)->shard_id);
 
-        if (allowed_present > 0 && !bot_in_this && !bot_in_any) {
+        if (allowed_present > 0 && !bot_here && !bot_any) {
             std::cout << "[EVAL] Joining channel " << channel_id << "\n";
             guild_transitioning[gid] = true;
             udp_hole_punched[gid]    = false;
             punch_active[gid] = std::make_shared<std::atomic<bool>>(true);
             if (shard) shard->connect_voice(gid, channel_id);
-        }
-        else if (allowed_present == 0 && bot_in_this) {
+        } else if (allowed_present == 0 && bot_here) {
             std::cout << "[EVAL] No allowed users left — disconnecting\n";
             guild_transitioning[gid] = true;
             if (punch_active.count(gid) && punch_active[gid])
@@ -295,6 +369,53 @@ void evaluate_vcs(dpp::cluster& bot) {
             if (shard) shard->disconnect_voice(gid);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared FFmpeg encode + append logic (used by both timer and overflow paths)
+// ---------------------------------------------------------------------------
+void enqueue_encode_and_append(std::vector<uint8_t> buf,
+                                const std::string& folder_path,
+                                const std::string& daily_mp3,
+                                const std::string& username,
+                                uint64_t           user_id) {
+    enqueue_ffmpeg([buf = std::move(buf), folder_path, daily_mp3, username, user_id]() mutable {
+        ensure_directory_exists(folder_path);
+
+        {
+            std::ofstream meta(folder_path + "/username.txt", std::ios::trunc);
+            meta << username << "\n";
+        }
+
+        std::string pcm_path  = folder_path + "/temp_chunk.pcm";
+        std::string chunk_mp3 = folder_path + "/temp_chunk.mp3";
+
+        {
+            std::ofstream f(pcm_path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+        }
+
+        std::string enc = build_ffmpeg_cmd(pcm_path, chunk_mp3);
+        int rc = std::system(enc.c_str());
+
+        struct stat st;
+        if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
+            std::cout << "[FFMPEG_JOB] Encode failed for user " << user_id << ", retrying...\n";
+            rc = std::system(enc.c_str());
+            if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
+                std::cout << "[FFMPEG_JOB] Retry failed. Saving raw PCM as recovery.\n";
+                std::string recovery = folder_path + "/recovery_"
+                                      + std::to_string(std::time(nullptr)) + ".pcm";
+                std::rename(pcm_path.c_str(), recovery.c_str());
+                return;
+            }
+        }
+        std::remove(pcm_path.c_str());
+
+        std::cout << "[FFMPEG_JOB] Encoded " << st.st_size
+                  << " bytes for user " << user_id << "\n";
+        append_mp3(daily_mp3, chunk_mp3, folder_path);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +429,12 @@ int main() {
         std::cout << "[MAIN] ERROR — Could not read DISCORD_TOKEN from .env!\n";
         return 1;
     }
+
+    std::cout << "[MAIN] Audio format: "
+              << RECORD_SAMPLE_RATE << "Hz, "
+              << RECORD_CHANNELS << "ch mono | "
+              << "Silence injection: " << SILENCE_INJECT_S << "s on gaps >= "
+              << GAP_THRESHOLD << "s\n";
 
     std::thread worker(ffmpeg_worker);
     dpp::cluster bot(DISCORD_TOKEN, dpp::i_all_intents);
@@ -335,15 +462,12 @@ int main() {
 
     bot.on_voice_state_update([&bot](const dpp::voice_state_update_t& event) {
         dpp::snowflake gid = event.state.guild_id;
-
-        // Safely update our isolated state map
         {
             std::lock_guard<std::mutex> lock(state_mutex);
-            if (event.state.channel_id == 0) {
+            if (event.state.channel_id == 0)
                 safe_voice_states[gid].erase(event.state.user_id);
-            } else {
+            else
                 safe_voice_states[gid][event.state.user_id] = event.state.channel_id;
-            }
         }
 
         if (event.state.user_id == bot.me.id) {
@@ -375,11 +499,11 @@ int main() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 attempts++;
             }
-
             if (!active->load())
                 std::cout << "[UDP_PUNCH] Stopped early for guild " << guild_id << "\n";
             else if (udp_hole_punched[guild_id])
-                std::cout << "[UDP_PUNCH] UDP open for guild " << guild_id << " after " << attempts << " attempts\n";
+                std::cout << "[UDP_PUNCH] UDP open for guild " << guild_id
+                          << " after " << attempts << " attempts\n";
             else
                 std::cout << "[UDP_PUNCH] Gave up after 20 attempts for guild " << guild_id << "\n";
         }).detach();
@@ -389,94 +513,98 @@ int main() {
         if (event.user_id == 0) return;
         if (!ALLOWED_USERS.count(event.user_id)) return;
 
-        bool is_silence = std::all_of(event.audio_data.begin(), event.audio_data.end(), [](uint8_t b) { return b == 0; });
-        if (is_silence) return; // Drop silence packets immediately
+        // Drop pure-silence packets (Discord sends these as keep-alives)
+        bool is_silence = std::all_of(
+            event.audio_data.begin(), event.audio_data.end(),
+            [](uint8_t b) { return b == 0; });
+        if (is_silence) return;
 
         dpp::snowflake guild_id = event.voice_client->server_id;
 
         if (!udp_hole_punched[guild_id]) {
-            std::cout << "[VOICE_RECV] First packet from guild " << guild_id << " — UDP open\n";
+            std::cout << "[VOICE_RECV] First packet from guild "
+                      << guild_id << " — UDP open\n";
             udp_hole_punched[guild_id] = true;
             if (punch_active.count(guild_id) && punch_active[guild_id])
                 punch_active[guild_id]->store(false);
         }
 
-        std::vector<uint8_t> buffer_to_save;
+        // Downsample from Discord format (48kHz stereo) → record format (16kHz mono)
+        std::vector<uint8_t> pcm = downsample_discord_packet(
+            reinterpret_cast<const uint8_t*>(event.audio_data.data()),
+            event.audio_data.size());
+
+        std::vector<uint8_t> overflow_buf;
         {
             std::lock_guard<std::mutex> lock(bot_mutex);
             auto& buf = audio_buffers[event.user_id];
+            auto  now = std::chrono::steady_clock::now();
 
-            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(event.audio_data.data());
-            buf.insert(buf.end(), ptr, ptr + event.audio_data.size());
+            // ── Silence injection ──────────────────────────────────────────
+            // If we've seen this user before and there's been a gap of >= 0.5s
+            // since their last packet, inject exactly SILENCE_INJECT_S of silence
+            // once. This prevents hard amplitude splices between speech bursts
+            // without causing runaway buffer growth during long pauses.
+            if (last_packet_time.count(event.user_id)) {
+                double gap = std::chrono::duration<double>(
+                    now - last_packet_time[event.user_id]).count();
+
+                if (gap >= GAP_THRESHOLD && !silence_injected[event.user_id]) {
+                    auto sil = make_silence_bytes(SILENCE_INJECT_S);
+                    buf.insert(buf.end(), sil.begin(), sil.end());
+                    silence_injected[event.user_id] = true;
+                }
+            }
+
+            // Reset silence flag — user is speaking again
+            silence_injected[event.user_id] = false;
+            last_packet_time[event.user_id] = now;
+
+            // Append downsampled PCM
+            buf.insert(buf.end(), pcm.begin(), pcm.end());
 
             if (++packet_counts[event.user_id] % 1000 == 0) {
                 std::cout << "[VOICE_RECV] User " << event.user_id
-                          << " — buffer: " << buf.size() << " bytes\n";
+                          << " — packets: " << packet_counts[event.user_id]
+                          << " — buffer: " << buf.size() << " bytes"
+                          << " (" << (buf.size() / 1024 / 1024) << " MB)\n";
             }
 
+            // Overflow guard — force save if buffer grows too large
             if (buf.size() >= MAX_BUFFER_SIZE) {
-                std::cout << "[VOICE_RECV] User " << event.user_id << " exceeded max buffer size (" << buf.size() << "). Forcing save.\n";
-                buffer_to_save = std::move(buf);
+                std::cout << "[VOICE_RECV] User " << event.user_id
+                          << " exceeded max buffer (" << buf.size()
+                          << " bytes). Forcing save.\n";
+                overflow_buf = std::move(buf);
                 audio_buffers[event.user_id].clear();
-                packet_counts[event.user_id] = 0;
+                packet_counts[event.user_id]  = 0;
+                silence_injected[event.user_id] = false;
+                last_packet_time.erase(event.user_id);
             }
         }
 
-        // Process forced save outside the mutex lock
-        if (!buffer_to_save.empty()) {
-            auto now_c = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-            char date_str[32];
-            std::strftime(date_str, sizeof(date_str), "%Y-%m-%d", std::localtime(&now_c));
-            std::string current_date(date_str);
+        // Process forced overflow save outside the lock
+        if (!overflow_buf.empty()) {
+            auto   now_c = std::chrono::system_clock::to_time_t(
+                               std::chrono::system_clock::now());
+            char   date_str[32];
+            std::strftime(date_str, sizeof(date_str), "%Y-%m-%d",
+                          std::localtime(&now_c));
 
             std::string folder_path = BASE_PATH + std::to_string(event.user_id);
-            std::string daily_mp3   = folder_path + "/" + current_date + ".mp3";
-            dpp::user* u = dpp::find_user(event.user_id);
-            std::string username = u ? u->username : "unknown";
+            std::string daily_mp3   = folder_path + "/" + std::string(date_str) + ".mp3";
+            dpp::user*  u           = dpp::find_user(event.user_id);
+            std::string username    = u ? u->username : "unknown";
 
-            uint64_t u_id = event.user_id;
-
-            enqueue_ffmpeg([buf = std::move(buffer_to_save), folder_path, daily_mp3, username, u_id]() mutable {
-                ensure_directory_exists(folder_path);
-
-                {
-                    std::ofstream meta(folder_path + "/username.txt", std::ios::trunc);
-                    meta << username << "\n";
-                }
-
-                std::string pcm_path  = folder_path + "/temp_chunk.pcm";
-                std::string chunk_mp3 = folder_path + "/temp_chunk.mp3";
-
-                {
-                    std::ofstream f(pcm_path, std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
-                }
-
-                std::string enc = "ffmpeg -y -f s16le -ar 48000 -ac 2 -i \"" + pcm_path
-                                  + "\" -b:a 192k \"" + chunk_mp3 + "\" > /dev/null 2>&1";
-                int rc = std::system(enc.c_str());
-
-                struct stat st;
-                if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
-                    std::cout << "[FFMPEG_JOB] Encode failed for user " << u_id << ", retrying...\n";
-                    rc = std::system(enc.c_str());
-                    if (rc != 0 || stat(chunk_mp3.c_str(), &st) != 0 || st.st_size == 0) {
-                        std::cout << "[FFMPEG_JOB] Retry failed. Saving raw PCM as recovery.\n";
-                        std::string recovery_pcm = folder_path + "/recovery_" + std::to_string(std::time(nullptr)) + ".pcm";
-                        std::rename(pcm_path.c_str(), recovery_pcm.c_str());
-                        return;
-                    }
-                }
-                std::remove(pcm_path.c_str());
-                std::cout << "[FFMPEG_JOB] Encoded " << st.st_size << " bytes for user " << u_id << "\n";
-                append_mp3(daily_mp3, chunk_mp3, folder_path);
-            });
+            enqueue_encode_and_append(std::move(overflow_buf), folder_path,
+                                      daily_mp3, username, event.user_id);
         }
     });
 
     bot.on_voice_client_disconnect([&bot](const dpp::voice_client_disconnect_t& event) {
         dpp::snowflake guild_id = event.voice_client->server_id;
-        std::cout << "[VOICE_DISCONNECT] Voice client lost for guild " << guild_id << " — resetting state\n";
+        std::cout << "[VOICE_DISCONNECT] Voice client lost for guild "
+                  << guild_id << " — resetting state\n";
 
         if (punch_active.count(guild_id) && punch_active[guild_id])
             punch_active[guild_id]->store(false);
@@ -488,7 +616,8 @@ int main() {
         std::cout << "[VOICE_DISCONNECT] evaluate_vcs will rejoin if users still present\n";
     });
 
-    std::cout << "[MAIN] Starting bot — chunk time: " << CHUNK_TIME << "s | path: " << BASE_PATH << "\n";
+    std::cout << "[MAIN] Starting bot — chunk time: " << CHUNK_TIME
+              << "s | path: " << BASE_PATH << "\n";
     bot.start(dpp::st_wait);
 
     ffmpeg_running = false;
