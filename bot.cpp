@@ -477,11 +477,28 @@ int main() {
         evaluate_vcs(bot);
     });
 
-    bot.on_voice_ready([](const dpp::voice_ready_t& event) {
+    bot.on_voice_ready([&bot](const dpp::voice_ready_t& event) {
         dpp::discord_voice_client* vc       = event.voice_client;
         dpp::snowflake             guild_id = vc->server_id;
         log("[VOICE_READY] Connected to guild " + std::to_string(guild_id)
             + " — starting UDP punch");
+
+        // Resync safe_voice_states from guild cache on every connect/reconnect
+        // This fixes stale state when the bot drops and rejoins mid-session
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            safe_voice_states[guild_id].clear();
+            dpp::guild* g = dpp::find_guild(guild_id);
+            if (g) {
+                for (const auto& [u_id, vs] : g->voice_members) {
+                    if (vs.channel_id != 0)
+                        safe_voice_states[guild_id][u_id] = vs.channel_id;
+                }
+                log("[VOICE_READY] Resynced " 
+                    + std::to_string(safe_voice_states[guild_id].size()) 
+                    + " voice members for guild " + std::to_string(guild_id));
+            }
+        }
 
         std::shared_ptr<std::atomic<bool>> active;
         if (punch_active.count(guild_id))
