@@ -26,17 +26,16 @@ std::string BASE_PATH        = "recordings/";
 int         CHUNK_TIME       = 300;
 const size_t MAX_BUFFER_SIZE = 300 * 1024 * 1024; // 300 MB
 
-const int RECORD_SAMPLE_RATE  = 16000;
-const int RECORD_CHANNELS     = 1;
-const int DISCORD_SAMPLE_RATE = 48000;
-const int DISCORD_CHANNELS    = 2;
-const int DISCORD_FRAME_SIZE  = 960;
+const int RECORD_SAMPLE_RATE   = 16000;
+const int RECORD_CHANNELS      = 1;
+const int DISCORD_SAMPLE_RATE  = 48000;
+const int DISCORD_CHANNELS     = 2;
+const int DISCORD_FRAME_SIZE   = 960;
 const int DISCORD_PACKET_BYTES = DISCORD_FRAME_SIZE * DISCORD_CHANNELS * 2;
 
 const double GAP_THRESHOLD    = 1.00;
 const double SILENCE_INJECT_S = 0.50;
 
-// Reconnect cooldown — prevents rapid reconnect loop after disconnect
 static constexpr int RECONNECT_COOLDOWN_SEC = 5;
 
 std::unordered_set<dpp::snowflake> ALLOWED_CHANNELS;
@@ -50,7 +49,6 @@ std::map<dpp::snowflake, bool>                               udp_hole_punched;
 std::map<dpp::snowflake, bool>                               guild_transitioning;
 std::map<dpp::snowflake, std::shared_ptr<std::atomic<bool>>> punch_active;
 
-// Reconnect cooldown — per guild timestamp of last disconnect
 std::map<dpp::snowflake, std::chrono::steady_clock::time_point> last_disconnect_time;
 
 std::map<dpp::snowflake, std::chrono::time_point<std::chrono::steady_clock>> last_packet_time;
@@ -218,7 +216,7 @@ std::string build_ffmpeg_cmd(const std::string& pcm_path, const std::string& mp3
 }
 
 // ---------------------------------------------------------------------------
-// Shared encode + append (used by timer save and overflow)
+// Shared encode + append
 // ---------------------------------------------------------------------------
 void enqueue_encode_and_append(std::vector<uint8_t> buf,
                                 const std::string&   folder_path,
@@ -359,7 +357,7 @@ void evaluate_vcs(dpp::cluster& bot) {
         dpp::snowflake gid = c->guild_id;
         if (guild_transitioning[gid]) continue;
 
-        // Reconnect cooldown — skip if we disconnected too recently
+        // Reconnect cooldown
         if (last_disconnect_time.count(gid)) {
             auto since = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - last_disconnect_time[gid]).count();
@@ -436,16 +434,18 @@ int main() {
         log("[READY] Bot online! Chunk time: " + std::to_string(CHUNK_TIME)
             + "s | Save path: " + BASE_PATH);
 
-        // Chunk save timer
+        // Confirm whitelisted config loaded correctly
+        log("[READY] Allowed channels: " + std::to_string(ALLOWED_CHANNELS.size()));
+        log("[READY] Allowed users: " + std::to_string(ALLOWED_USERS.size()));
+        for (const auto& uid : ALLOWED_USERS)
+            log("[READY]   - user " + std::to_string(uid));
+
         bot.start_timer([&bot](dpp::timer) {
             save_and_clear_buffers(bot);
         }, CHUNK_TIME);
 
-        // Evaluate VCs + heartbeat file every 10 seconds
-        // Heartbeat is based on the timer firing — not on audio —
-        // so muted users do not cause false alarms
         bot.start_timer([&bot](dpp::timer) {
-            std::ofstream("/tmp/bot_heartbeat"); // Docker healthcheck reads this
+            std::ofstream("/tmp/bot_heartbeat");
             verify_bot_placement(bot);
             evaluate_vcs(bot);
         }, 10);
@@ -469,6 +469,11 @@ int main() {
             }
             return;
         }
+
+        // FIX: only re-evaluate when a WHITELISTED user changes state
+        // Non-whitelisted users joining/leaving should never trigger a disconnect
+        if (!ALLOWED_USERS.count(event.state.user_id)) return;
+
         evaluate_vcs(bot);
     });
 
