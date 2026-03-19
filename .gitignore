@@ -9,3 +9,10 @@ test.py
 test.ipynb
 silero_vad.onnx
 *.bak
+.gitignore
+.testenv
+test
+test.cpp
+bot.log
+recordings/
+recordings/*
