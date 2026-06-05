@@ -16,3 +16,15 @@ test.cpp
 bot.log
 recordings/
 recordings/*
+
+# Testing Files
+*.mp3
+bot.log.before_patch
+clean_concat.py
+debug_bot
+debug_segments
+debug_segments.cpp
+diag.log.before_patch
+hello.cpp
+segments/
+segments_1st_try/
